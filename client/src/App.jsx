@@ -766,7 +766,7 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
           </div>
 
           <div className="table-wrap">
-            <table>
+            <table >
               <thead>
                 <tr>
                   <th>Grupo</th>
