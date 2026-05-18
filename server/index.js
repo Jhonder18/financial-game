@@ -27,6 +27,16 @@ const PHASE_NAMES = {
   6: "Resultados finales"
 };
 
+const PHASE_MAX_STEPS = {
+  0: 0,
+  1: 1,
+  2: 3,
+  3: 0,
+  4: 1,
+  5: 1,
+  6: 0
+};
+
 const rooms = {};
 
 app.use(
@@ -42,6 +52,7 @@ function createRoom(roomCode) {
     started: false,
     finished: false,
     phase: 0,
+    phaseStep: 0,
     adminSocketId: null,
     players: [],
     logs: [],
@@ -114,7 +125,8 @@ function createPlayer({ socketId, name, role }) {
       4: INITIAL_BALANCE,
       5: INITIAL_BALANCE,
       6: INITIAL_BALANCE
-    }
+    },
+    transactions: []
   };
 }
 
@@ -134,7 +146,8 @@ function serializePlayer(player) {
     projectResolved: player.projectResolved,
     projectWheelResolved: player.projectWheelResolved,
     projectWheel: player.projectWheel,
-    history: { ...player.history }
+    history: { ...player.history },
+    transactions: (player.transactions || []).slice(-50)
   };
 }
 
@@ -177,6 +190,7 @@ function getRoomSnapshot(room) {
       strategyA: room.wheels.strategyA,
       strategyC: room.wheels.strategyC
     },
+    phaseStep: room.phaseStep || 0,
     winner: room.winner
   };
 }
@@ -192,7 +206,8 @@ function publishRoom(room, options = {}) {
       phaseName: snapshot.phaseName,
       started: snapshot.started,
       finished: snapshot.finished,
-      roomCode: snapshot.roomCode
+      roomCode: snapshot.roomCode,
+      phaseStep: snapshot.phaseStep
     });
   }
 
@@ -205,7 +220,8 @@ function publishRoom(room, options = {}) {
         balance: player.balance,
         strategy: player.strategy,
         project: player.project,
-        history: player.history
+        history: player.history,
+        transactions: player.transactions
       }))
     });
   }
@@ -232,6 +248,7 @@ function resetRoomForNewGame(room) {
   };
   room.winner = null;
   room.ranking = [];
+  room.phaseStep = 0;
 
   room.players.forEach((player) => {
     player.connected = true;
@@ -253,6 +270,7 @@ function resetRoomForNewGame(room) {
       5: INITIAL_BALANCE,
       6: INITIAL_BALANCE
     };
+    player.transactions = [];
   });
 }
 
@@ -264,6 +282,31 @@ function setPhaseSnapshot(room, phase) {
 
 function applyInitialRound(room) {
   room.players.forEach((player) => {
+    player.transactions = player.transactions || [];
+    player.transactions.push({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      time: timestamp(),
+      phase: 1,
+      type: "initial-balance",
+      amount: INITIAL_BALANCE,
+      description: `Saldo inicial`
+    });
+    player.transactions.push({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      time: timestamp(),
+      phase: 1,
+      type: "income",
+      amount: BASE_INCOME,
+      description: `Ingreso fase 1`
+    });
+    player.transactions.push({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      time: timestamp(),
+      phase: 1,
+      type: "expense",
+      amount: -BASE_EXPENSES,
+      description: `Gasto fase 1`
+    });
     player.balance = INITIAL_BALANCE + BASE_INCOME - BASE_EXPENSES;
     player.history[1] = player.balance;
   });
@@ -298,6 +341,15 @@ function settleProjectReturns(room, phase) {
       player.balance += 4000;
       player.projectResolved = true;
       player.history[phase] = player.balance;
+      player.transactions = player.transactions || [];
+      player.transactions.push({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        time: timestamp(),
+        phase,
+        type: "project-return",
+        amount: 4000,
+        description: `Retorno automático Proyecto Z`
+      });
       pushLog(room, `${player.name} recupera el retorno automático de Proyecto Z.`);
     }
   });
@@ -406,7 +458,8 @@ io.on("connection", (socket) => {
       phaseName: snapshot.phaseName,
       started: snapshot.started,
       finished: snapshot.finished,
-      roomCode: snapshot.roomCode
+      roomCode: snapshot.roomCode,
+      phaseStep: snapshot.phaseStep
     });
     socket.emit("ranking-updated", snapshot.ranking);
   });
@@ -454,9 +507,19 @@ io.on("connection", (socket) => {
 
     player.strategy = strategy;
     player.strategyApplied = true;
-    player.balance -= strategies[strategy].cost;
+    const cost = strategies[strategy].cost;
+    player.balance -= cost;
     player.history[1] = player.balance;
-    pushLog(room, `${player.name} eligió la estrategia ${strategy} y pagó ${strategies[strategy].cost}.`);
+    player.transactions = player.transactions || [];
+    player.transactions.push({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      time: timestamp(),
+      phase: room.phase,
+      type: "strategy",
+      amount: -cost,
+      description: `Pago estrategia ${strategy}`
+    });
+    pushLog(room, `${player.name} eligió la estrategia ${strategy} y pagó ${cost}.`);
 
     publishRoom(room, { balances: true, ranking: true });
   });
@@ -466,6 +529,10 @@ io.on("connection", (socket) => {
     const player = getPlayerById(room, playerId) || getPlayer(room, socket.id);
 
     if (!room.started || room.phase !== 2 || !player || player.project) {
+      return;
+    }
+
+    if ((room.phaseStep || 0) < 2) {
       return;
     }
 
@@ -484,10 +551,20 @@ io.on("connection", (socket) => {
     player.project = project;
     player.projectSelectedPhase = room.phase;
     player.projectReturnPhase = selectedProject.returnPhase;
-    player.balance -= selectedProject.cost;
+    const cost = selectedProject.cost;
+    player.balance -= cost;
     player.history[room.phase] = player.balance;
+    player.transactions = player.transactions || [];
+    player.transactions.push({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      time: timestamp(),
+      phase: room.phase,
+      type: "project-invest",
+      amount: -cost,
+      description: `Inversión en Proyecto ${project}`
+    });
 
-    pushLog(room, `${player.name} invirtió en Proyecto ${project} y pagó ${selectedProject.cost}.`);
+    pushLog(room, `${player.name} invirtió en Proyecto ${project} y pagó ${cost}.`);
 
     publishRoom(room, { balances: true, ranking: true });
   });
@@ -496,6 +573,11 @@ io.on("connection", (socket) => {
     const room = getRoom(roomCode);
 
     if (!room.started || room.phase < 2 || room.phase > 5) {
+      return;
+    }
+
+    // Prevent applying monthly values more than once per phase
+    if (room.monthlyInputs[room.phase]) {
       return;
     }
 
@@ -514,7 +596,31 @@ io.on("connection", (socket) => {
         Boolean(specialEventActive)
       );
 
-      player.balance += impact.income - impact.expenses;
+      const net = impact.income - impact.expenses;
+      if (!player.transactions) player.transactions = [];
+      if (impact.income) {
+        player.transactions.push({
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          time: timestamp(),
+          phase: room.phase,
+          type: "income",
+          amount: impact.income,
+          description: `Ingreso mensual fase ${room.phase}`
+        });
+      }
+
+      if (impact.expenses) {
+        player.transactions.push({
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          time: timestamp(),
+          phase: room.phase,
+          type: "expense",
+          amount: -impact.expenses,
+          description: `Gasto mensual fase ${room.phase}`
+        });
+      }
+
+      player.balance += net;
       player.history[room.phase] = player.balance;
     });
 
@@ -524,13 +630,33 @@ io.on("connection", (socket) => {
     );
 
     settleProjectReturns(room, room.phase);
-    publishRoom(room, { balances: true, ranking: true });
+
+    // In phase 2, once monthly values are applied, move to confirmation step (step 1).
+    if (room.phase === 2 && room.phaseStep < 1) {
+      room.phaseStep = 1;
+    }
+
+    // In phases 4 and 5, once monthly values are applied, move to wheel step (step 1).
+    if ((room.phase === 4 || room.phase === 5) && room.phaseStep < 1) {
+      room.phaseStep = 1;
+    }
+
+    publishRoom(room, { phase: true, balances: true, ranking: true });
   });
 
   socket.on("spin-wheel", ({ roomCode, wheelType, playerId, option } = {}) => {
     const room = getRoom(roomCode);
 
     if (!room.started || room.phase < 2 || room.phase > 5) {
+      return;
+    }
+
+    // In phase 2, wheels are in step 0 (strategy wheels before confirmation).
+    // In phases 4 and 5, wheels are in step 1 (after monthly control).
+    if (room.phase === 2 && (wheelType === "strategyA" || wheelType === "strategyC") && (room.phaseStep || 0) !== 0) {
+      return;
+    }
+    if ((room.phase === 4 || room.phase === 5) && (room.phaseStep || 0) < 1) {
       return;
     }
 
@@ -542,17 +668,28 @@ io.on("connection", (socket) => {
       const resolvedOption = option || (Math.random() < 0.5 ? "crisis" : "normal");
       const amount = resolvedOption === "crisis" ? 500 : 3000;
 
+      const wheelResult = resolvedOption === "crisis" ? "Sí hubo crisis" : "No hubo crisis";
       room.wheels.strategyA = {
         type: "strategyA",
         option: resolvedOption,
         amount,
-        label: resolvedOption === "crisis" ? "Sí hubo crisis" : "No hubo crisis"
+        label: wheelResult,
+        outcome: wheelResult
       };
 
       room.players.forEach((player) => {
         if (player.strategy === "A") {
           player.balance += amount;
           player.history[2] = player.balance;
+          player.transactions = player.transactions || [];
+          player.transactions.push({
+            id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+            time: timestamp(),
+            phase: room.phase,
+            type: "wheel-strategyA",
+            amount: amount,
+            description: `Resultado ruleta Marketing: ${room.wheels.strategyA.label}`
+          });
         }
       });
 
@@ -570,17 +707,28 @@ io.on("connection", (socket) => {
       const resolvedOption = option || (Math.random() < 0.5 ? "success" : "fail");
       const amount = resolvedOption === "success" ? 5000 : 0;
 
+      const wheelResult = resolvedOption === "success" ? "Innovación exitosa" : "Innovación fallida";
       room.wheels.strategyC = {
         type: "strategyC",
         option: resolvedOption,
         amount,
-        label: resolvedOption === "success" ? "Innovación exitosa" : "Innovación fallida"
+        label: wheelResult,
+        outcome: wheelResult
       };
 
       room.players.forEach((player) => {
         if (player.strategy === "C") {
           player.balance += amount;
           player.history[2] = player.balance;
+          player.transactions = player.transactions || [];
+          player.transactions.push({
+            id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+            time: timestamp(),
+            phase: room.phase,
+            type: "wheel-strategyC",
+            amount: amount,
+            description: `Resultado ruleta Innovación: ${room.wheels.strategyC.label}`
+          });
         }
       });
 
@@ -624,6 +772,15 @@ io.on("connection", (socket) => {
         label: typeof selected === "string" ? selected : selected.label
       };
       player.history[4] = player.balance;
+      player.transactions = player.transactions || [];
+      player.transactions.push({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        time: timestamp(),
+        phase: 4,
+        type: "project-wheel",
+        amount: reward,
+        description: `Ruleta Proyecto X: ${player.projectWheel.label}`
+      });
 
       pushLog(room, `${player.name} giró la ruleta de Proyecto X y obtuvo ${reward}.`);
       publishRoom(room, { balances: true, ranking: true });
@@ -659,6 +816,15 @@ io.on("connection", (socket) => {
         label: typeof selected === "string" ? selected : selected.label
       };
       player.history[5] = player.balance;
+      player.transactions = player.transactions || [];
+      player.transactions.push({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        time: timestamp(),
+        phase: 5,
+        type: "project-wheel",
+        amount: reward,
+        description: `Ruleta Proyecto Y: ${player.projectWheel.label}`
+      });
 
       pushLog(room, `${player.name} giró la ruleta de Proyecto Y y obtuvo ${reward}.`);
       publishRoom(room, { balances: true, ranking: true });
@@ -681,6 +847,12 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const requiredSteps = PHASE_MAX_STEPS[room.phase] || 0;
+
+    if ((room.phaseStep || 0) < requiredSteps) {
+      return;
+    }
+
     setPhaseSnapshot(room, room.phase);
 
     if (room.phase === 2) {
@@ -688,6 +860,7 @@ io.on("connection", (socket) => {
     }
 
     room.phase += 1;
+    room.phaseStep = 0;
 
     if (room.phase === 6) {
       finishGame(room);
@@ -695,6 +868,28 @@ io.on("connection", (socket) => {
 
     pushLog(room, `El juego avanzó a la fase ${room.phase}: ${PHASE_NAMES[room.phase]}.`);
     publishRoom(room, { phase: true, balances: true, ranking: true, finished: room.finished });
+  });
+
+  socket.on("next-step", ({ roomCode } = {}) => {
+    const room = getRoom(roomCode);
+
+    if (room.adminSocketId && room.adminSocketId !== socket.id) {
+      return;
+    }
+
+    if (!room.started) {
+      return;
+    }
+
+    const requiredSteps = PHASE_MAX_STEPS[room.phase] || 0;
+
+    if (requiredSteps === 0 || (room.phaseStep || 0) >= requiredSteps) {
+      return;
+    }
+
+    room.phaseStep = (room.phaseStep || 0) + 1;
+    pushLog(room, `El admin avanzó al paso ${room.phaseStep} de la fase ${room.phase}.`);
+    publishRoom(room, { phase: true, balances: true, ranking: true });
   });
 
   socket.on("disconnect", () => {

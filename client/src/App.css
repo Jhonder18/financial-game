@@ -102,6 +102,27 @@
   gap: 20px;
 }
 
+.phase-view {
+  position: relative;
+}
+
+.phase-banner {
+  position: relative;
+  overflow: hidden;
+}
+
+.phase-banner::after {
+  content: "";
+  position: absolute;
+  right: -40px;
+  top: -40px;
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.18), transparent 68%);
+  pointer-events: none;
+}
+
 .content-grid--host,
 .content-grid--game {
   grid-template-columns: 1fr;
@@ -115,6 +136,39 @@
   border-radius: 28px;
   padding: 24px;
   backdrop-filter: blur(18px);
+}
+
+.phase-view--0 .panel {
+  border-color: rgba(116, 190, 255, 0.25);
+}
+
+.phase-view--1 .panel {
+  border-color: rgba(246, 200, 95, 0.3);
+  background: linear-gradient(180deg, rgba(28, 18, 7, 0.86), rgba(20, 11, 4, 0.95));
+}
+
+.phase-view--2 .panel {
+  border-color: rgba(87, 233, 173, 0.3);
+  background: linear-gradient(180deg, rgba(8, 30, 24, 0.86), rgba(5, 18, 14, 0.95));
+}
+
+.phase-view--3 .panel {
+  border-color: rgba(120, 158, 255, 0.3);
+}
+
+.phase-view--4 .panel {
+  border-color: rgba(255, 128, 102, 0.32);
+  background: linear-gradient(180deg, rgba(34, 12, 14, 0.86), rgba(20, 7, 8, 0.95));
+}
+
+.phase-view--5 .panel {
+  border-color: rgba(255, 199, 99, 0.3);
+  background: linear-gradient(180deg, rgba(30, 20, 8, 0.86), rgba(17, 11, 4, 0.95));
+}
+
+.phase-view--6 .panel {
+  border-color: rgba(169, 132, 255, 0.32);
+  background: linear-gradient(180deg, rgba(20, 11, 36, 0.86), rgba(11, 7, 20, 0.95));
 }
 
 .hero-card--main {
