@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { BrowserRouter, Link, NavLink, Route, Routes, useNavigate, useSearchParams } from "react-router-dom";
 import { io } from "socket.io-client";
 import "./App.css";
@@ -139,6 +139,7 @@ function mergePlayers(existingPlayers = [], incomingPlayers = []) {
 function useGameSocket() {
   const [snapshot, setSnapshot] = useState(null);
   const [lastWheel, setLastWheel] = useState(null);
+  const [activeWheel, setActiveWheel] = useState(null);
   const [connected, setConnected] = useState(socket.connected);
 
   useEffect(() => {
@@ -161,7 +162,13 @@ function useGameSocket() {
         };
       });
     };
-    const handleWheel = (payload) => setLastWheel(payload);
+    const handleWheelStart = (payload) => {
+      setActiveWheel({ ...payload, status: "spinning" });
+    };
+    const handleWheel = (payload) => {
+      setActiveWheel({ ...payload, status: "resolved" });
+      setLastWheel(payload);
+    };
 
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
@@ -193,6 +200,7 @@ function useGameSocket() {
         };
       });
     });
+    socket.on("wheel-start", handleWheelStart);
     socket.on("wheel-result", handleWheel);
 
     return () => {
@@ -204,6 +212,7 @@ function useGameSocket() {
       socket.off("game-finished", handleSnapshot);
       socket.off("ranking-updated");
       socket.off("phase-updated");
+      socket.off("wheel-start", handleWheelStart);
       socket.off("wheel-result", handleWheel);
     };
   }, []);
@@ -223,6 +232,8 @@ function useGameSocket() {
   return {
     snapshot,
     lastWheel,
+    activeWheel,
+    clearActiveWheel: useCallback(() => setActiveWheel(null), []),
     connected,
     socketId: socket.id,
     emitJoin,
@@ -253,6 +264,7 @@ function App() {
     <BrowserRouter>
       <div className="app-shell">
         <Header connected={game.connected} snapshot={game.snapshot} />
+        <WheelModal wheel={game.activeWheel} formatMoney={formatMoney} onClose={game.clearActiveWheel} />
         <main className="app-main">
           <Routes>
             <Route path="/" element={<LandingPage snapshot={game.snapshot} />} />
@@ -464,6 +476,10 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   const currentPhase = snapshot?.phase ?? 0;
   const currentStep = snapshot?.phaseStep ?? 0;
   const hasMonthlyApplied = snapshot?.monthlyInputs?.[currentPhase] !== undefined;
+  const isStrategyWheelBusy = snapshot?.wheels?.strategyA?.status === "spinning" || snapshot?.wheels?.strategyC?.status === "spinning";
+  const hasPendingProjectWheel =
+    (currentPhase === 4 && (snapshot?.players || []).some((player) => player.project === "X" && !player.projectWheelResolved)) ||
+    (currentPhase === 5 && (snapshot?.players || []).some((player) => player.project === "Y" && !player.projectWheelResolved));
 
   const strategyAPlayers = snapshot?.players?.filter((player) => player.strategy === "A") || [];
   const strategyCPlayers = snapshot?.players?.filter((player) => player.strategy === "C") || [];
@@ -472,8 +488,8 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   const maxStepForPhase = phaseMaxSteps[currentPhase] ?? 0;
   const isStarted = Boolean(snapshot?.started);
   const canStartGame = !isStarted;
-  const canGoNextStep = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep < maxStepForPhase;
-  const canGoNextPhase = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep >= maxStepForPhase;
+  const canGoNextStep = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep < maxStepForPhase && !isStrategyWheelBusy;
+  const canGoNextPhase = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep >= maxStepForPhase && !hasPendingProjectWheel;
   const canApplyMonth = currentPhase >= 2 && currentPhase <= 5;
   const monthlyForCurrentPhase = snapshot?.monthlyInputs?.[currentPhase] || null;
 
@@ -488,7 +504,13 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
           <div className="form-grid">
             <label>
               Introduce la clave de confirmación
-              <input value={adminPasscode} onChange={(e) => setAdminPasscode(e.target.value)} placeholder="Clave" />
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={adminPasscode}
+                onChange={(e) => setAdminPasscode(e.target.value)}
+                placeholder="Password"
+              />
             </label>
             <div className="button-row">
               <button
@@ -973,6 +995,119 @@ function GamePage({ snapshot, lastWheel, emitStrategy, emitProject, identity, fo
         </div>
       </article>
     </section>
+  );
+}
+
+function WheelModal({ wheel, formatMoney, onClose }) {
+  const [displayedIndex, setDisplayedIndex] = useState(0);
+
+  useEffect(() => {
+    if (!wheel || wheel.status !== "resolved") {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      onClose();
+    }, 10000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [wheel, onClose]);
+
+  useEffect(() => {
+    if (!wheel) {
+      return undefined;
+    }
+
+    const options = wheel.options || [];
+
+    if (!options.length) {
+      return undefined;
+    }
+
+    if (wheel.status === "resolved") {
+      const selectedIndex = Math.max(
+        0,
+        options.findIndex((option) => option.value === (wheel.selectedOption || wheel.option))
+      );
+
+      const frameId = window.requestAnimationFrame(() => {
+        setDisplayedIndex(selectedIndex);
+      });
+
+      return () => window.cancelAnimationFrame(frameId);
+    }
+
+    if (wheel.status === "spinning") {
+      let currentIndex = 0;
+
+      const intervalId = window.setInterval(() => {
+        currentIndex = (currentIndex + 1) % options.length;
+        setDisplayedIndex(currentIndex);
+      }, 90);
+
+      return () => window.clearInterval(intervalId);
+    }
+
+      return undefined;
+  }, [wheel]);
+
+  if (!wheel) {
+    return null;
+  }
+
+  const title = wheel.title || (wheel.type === "strategyA" ? "Marketing" : wheel.type === "strategyC" ? "Innovación" : wheel.type === "projectX" ? "Proyecto X" : wheel.type === "projectY" ? "Proyecto Y" : "Ruleta");
+  const scopeText = wheel.scope === "individual" ? `Jugador: ${wheel.playerName || wheel.audience || "N/A"}` : "Afecta a toda la sala";
+  const resultText = wheel.outcome || wheel.label || wheel.option || "Pendiente";
+  const options = wheel.options || [];
+  const activeOption = options.length ? options[displayedIndex % options.length] : null;
+  const activeOptionLabel = wheel.status === "resolved" ? resultText : activeOption?.label || "Girando";
+  const activeOptionAmount = wheel.status === "resolved" ? wheel.amount || 0 : activeOption?.amount ?? 0;
+  const confettiPieces = wheel.status === "resolved" ? Array.from({ length: 14 }, (_, index) => index) : [];
+
+  return (
+    <div className="wheel-modal-backdrop" role="dialog" aria-modal="true" aria-label="Resultado de ruleta">
+      <section className="wheel-modal panel">
+        <div className={`wheel-modal__disc ${wheel.status === "spinning" ? "is-spinning" : "is-resolved"}`} aria-hidden="true">
+          {confettiPieces.length ? (
+            <div className="wheel-modal__confetti">
+              {confettiPieces.map((piece) => (
+                <span key={piece} className={`wheel-modal__confetti-piece wheel-modal__confetti-piece--${piece % 7}`} />
+              ))}
+            </div>
+          ) : null}
+          <div className="wheel-modal__disc-core">
+            <span className="wheel-modal__status">{wheel.status === "spinning" ? "Girando" : "Cayó"}</span>
+            <strong className={`wheel-modal__option ${wheel.status === "resolved" ? "is-settled" : "is-rolling"}`}>
+              {activeOptionLabel}
+            </strong>
+            <span className="wheel-modal__amount">
+              {activeOptionAmount >= 0 ? "+" : ""}{formatMoney(activeOptionAmount)}
+            </span>
+          </div>
+        </div>
+        <div className="wheel-modal__content">
+          <p className="eyebrow">Resolución de ruleta</p>
+          <h2>{title}</h2>
+          <p className="muted">{scopeText}</p>
+          {wheel.status === "spinning" ? (
+            <div className="callout">La ruleta está girando en tiempo real. Espera el resultado final.</div>
+          ) : (
+            <div className="callout">
+              <strong>{resultText}</strong>
+              <br />
+              Impacto aplicado: {wheel.amount >= 0 ? "+" : ""}{formatMoney(wheel.amount || 0)}
+            </div>
+          )}
+          <div className="button-row">
+            {wheel.status === "resolved" ? (
+              <button className="button button-secondary" type="button" onClick={onClose}>
+                Cerrar
+              </button>
+            ) : null}
+          </div>
+        </div>
+      </section>
+    </div>
   );
 }
 

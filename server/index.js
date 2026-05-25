@@ -101,6 +101,28 @@ function getPlayerById(room, playerId) {
   return room.players.find((player) => player.id === playerId) || null;
 }
 
+function emitWheelEvent(targetSocketIds, eventName, payload) {
+  const socketIds = Array.isArray(targetSocketIds) ? targetSocketIds : [targetSocketIds];
+
+  socketIds.filter(Boolean).forEach((socketId) => {
+    io.to(socketId).emit(eventName, payload);
+  });
+}
+
+function hasPendingStrategyWheels(room) {
+  const hasStrategyAPlayers = room.players.some((player) => player.strategy === "A");
+  const hasStrategyCPlayers = room.players.some((player) => player.strategy === "C");
+
+  return (
+    (hasStrategyAPlayers && (!room.wheels.strategyA || room.wheels.strategyA.status !== "resolved")) ||
+    (hasStrategyCPlayers && (!room.wheels.strategyC || room.wheels.strategyC.status !== "resolved"))
+  );
+}
+
+function hasPendingProjectWheels(room, projectType) {
+  return room.players.some((player) => player.project === projectType && !player.projectWheelResolved);
+}
+
 function createPlayer({ socketId, name, role }) {
   return {
     id: `${socketId}-${Math.random().toString(16).slice(2)}`,
@@ -116,6 +138,7 @@ function createPlayer({ socketId, name, role }) {
     projectReturnPhase: null,
     projectResolved: false,
     projectWheelResolved: false,
+    projectWheelInProgress: false,
     projectWheel: null,
     history: {
       0: INITIAL_BALANCE,
@@ -145,6 +168,7 @@ function serializePlayer(player) {
     projectReturnPhase: player.projectReturnPhase,
     projectResolved: player.projectResolved,
     projectWheelResolved: player.projectWheelResolved,
+    projectWheelInProgress: player.projectWheelInProgress,
     projectWheel: player.projectWheel,
     history: { ...player.history },
     transactions: (player.transactions || []).slice(-50)
@@ -260,6 +284,7 @@ function resetRoomForNewGame(room) {
     player.projectReturnPhase = null;
     player.projectResolved = false;
     player.projectWheelResolved = false;
+    player.projectWheelInProgress = false;
     player.projectWheel = null;
     player.history = {
       0: INITIAL_BALANCE,
@@ -353,6 +378,20 @@ function settleProjectReturns(room, phase) {
       pushLog(room, `${player.name} recupera el retorno automático de Proyecto Z.`);
     }
   });
+}
+
+function finalizeGlobalWheel(room, wheelType, resolvedWheel) {
+  room.wheels[wheelType] = resolvedWheel;
+  publishRoom(room, { balances: true, ranking: true });
+  io.to(room.roomCode).emit("wheel-result", resolvedWheel);
+}
+
+function finalizeProjectWheel(room, player, resolvedWheel) {
+  player.projectWheelResolved = true;
+  player.projectWheelInProgress = false;
+  player.projectWheel = resolvedWheel;
+  publishRoom(room, { balances: true, ranking: true });
+  emitWheelEvent([room.adminSocketId, player.socketId], "wheel-result", resolvedWheel);
 }
 
 function calculateProjectXReward(option) {
@@ -665,37 +704,59 @@ io.on("connection", (socket) => {
         return;
       }
 
+      const options = [
+        { label: "Sí hubo crisis", value: "crisis", amount: 500 },
+        { label: "No hubo crisis", value: "normal", amount: 3000 }
+      ];
       const resolvedOption = option || (Math.random() < 0.5 ? "crisis" : "normal");
       const amount = resolvedOption === "crisis" ? 500 : 3000;
 
       const wheelResult = resolvedOption === "crisis" ? "Sí hubo crisis" : "No hubo crisis";
       room.wheels.strategyA = {
         type: "strategyA",
+        scope: "global",
+        status: "spinning",
         option: resolvedOption,
         amount,
         label: wheelResult,
-        outcome: wheelResult
+        outcome: wheelResult,
+        title: "Marketing",
+        audience: "Toda la sala",
+        options,
+        selectedOption: resolvedOption
       };
 
-      room.players.forEach((player) => {
-        if (player.strategy === "A") {
-          player.balance += amount;
-          player.history[2] = player.balance;
-          player.transactions = player.transactions || [];
-          player.transactions.push({
-            id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-            time: timestamp(),
-            phase: room.phase,
-            type: "wheel-strategyA",
-            amount: amount,
-            description: `Resultado ruleta Marketing: ${room.wheels.strategyA.label}`
-          });
-        }
-      });
+      io.to(room.roomCode).emit("wheel-start", room.wheels.strategyA);
 
-      pushLog(room, `Ruleta de Marketing resuelta: ${room.wheels.strategyA.label}.`);
-      publishRoom(room, { balances: true, ranking: true });
-      io.to(room.roomCode).emit("wheel-result", room.wheels.strategyA);
+      setTimeout(() => {
+        const currentWheel = room.wheels.strategyA;
+
+        if (!currentWheel || currentWheel.status !== "spinning") {
+          return;
+        }
+
+        room.players.forEach((player) => {
+          if (player.strategy === "A") {
+            player.balance += amount;
+            player.history[2] = player.balance;
+            player.transactions = player.transactions || [];
+            player.transactions.push({
+              id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+              time: timestamp(),
+              phase: room.phase,
+              type: "wheel-strategyA",
+              amount: amount,
+              description: `Resultado ruleta Marketing: ${currentWheel.label}`
+            });
+          }
+        });
+
+        pushLog(room, `Ruleta de Marketing resuelta: ${currentWheel.label}.`);
+        finalizeGlobalWheel(room, "strategyA", {
+          ...currentWheel,
+          status: "resolved"
+        });
+      }, 1800);
       return;
     }
 
@@ -704,37 +765,59 @@ io.on("connection", (socket) => {
         return;
       }
 
+      const options = [
+        { label: "Innovación exitosa", value: "success", amount: 5000 },
+        { label: "Innovación fallida", value: "fail", amount: 0 }
+      ];
       const resolvedOption = option || (Math.random() < 0.5 ? "success" : "fail");
       const amount = resolvedOption === "success" ? 5000 : 0;
 
       const wheelResult = resolvedOption === "success" ? "Innovación exitosa" : "Innovación fallida";
       room.wheels.strategyC = {
         type: "strategyC",
+        scope: "global",
+        status: "spinning",
         option: resolvedOption,
         amount,
         label: wheelResult,
-        outcome: wheelResult
+        outcome: wheelResult,
+        title: "Innovación",
+        audience: "Toda la sala",
+        options,
+        selectedOption: resolvedOption
       };
 
-      room.players.forEach((player) => {
-        if (player.strategy === "C") {
-          player.balance += amount;
-          player.history[2] = player.balance;
-          player.transactions = player.transactions || [];
-          player.transactions.push({
-            id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-            time: timestamp(),
-            phase: room.phase,
-            type: "wheel-strategyC",
-            amount: amount,
-            description: `Resultado ruleta Innovación: ${room.wheels.strategyC.label}`
-          });
-        }
-      });
+      io.to(room.roomCode).emit("wheel-start", room.wheels.strategyC);
 
-      pushLog(room, `Ruleta de Innovación resuelta: ${room.wheels.strategyC.label}.`);
-      publishRoom(room, { balances: true, ranking: true });
-      io.to(room.roomCode).emit("wheel-result", room.wheels.strategyC);
+      setTimeout(() => {
+        const currentWheel = room.wheels.strategyC;
+
+        if (!currentWheel || currentWheel.status !== "spinning") {
+          return;
+        }
+
+        room.players.forEach((player) => {
+          if (player.strategy === "C") {
+            player.balance += amount;
+            player.history[2] = player.balance;
+            player.transactions = player.transactions || [];
+            player.transactions.push({
+              id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+              time: timestamp(),
+              phase: room.phase,
+              type: "wheel-strategyC",
+              amount: amount,
+              description: `Resultado ruleta Innovación: ${currentWheel.label}`
+            });
+          }
+        });
+
+        pushLog(room, `Ruleta de Innovación resuelta: ${currentWheel.label}.`);
+        finalizeGlobalWheel(room, "strategyC", {
+          ...currentWheel,
+          status: "resolved"
+        });
+      }, 1800);
       return;
     }
 
@@ -762,29 +845,53 @@ io.on("connection", (socket) => {
       const selectedValue = typeof selected === "string" ? selected : selected.value;
       const reward = calculateProjectXReward(selectedValue);
 
-      player.balance += reward;
-      player.projectWheelResolved = true;
-      player.projectResolved = true;
       player.projectWheel = {
         type: "projectX",
+        scope: "individual",
+        status: "spinning",
         option: selectedValue,
         amount: reward,
-        label: typeof selected === "string" ? selected : selected.label
+        label: typeof selected === "string" ? selected : selected.label,
+        title: "Proyecto X",
+        playerId: player.id,
+        playerName: player.name,
+        audience: player.name,
+        options,
+        selectedOption: selectedValue
       };
-      player.history[4] = player.balance;
-      player.transactions = player.transactions || [];
-      player.transactions.push({
-        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        time: timestamp(),
-        phase: 4,
-        type: "project-wheel",
-        amount: reward,
-        description: `Ruleta Proyecto X: ${player.projectWheel.label}`
-      });
 
-      pushLog(room, `${player.name} giró la ruleta de Proyecto X y obtuvo ${reward}.`);
-      publishRoom(room, { balances: true, ranking: true });
-      io.to(room.roomCode).emit("wheel-result", player.projectWheel);
+      player.projectWheelInProgress = true;
+      emitWheelEvent([room.adminSocketId, player.socketId], "wheel-start", player.projectWheel);
+
+      setTimeout(() => {
+        const currentWheel = player.projectWheel;
+
+        if (!currentWheel || currentWheel.status !== "spinning") {
+          return;
+        }
+
+        player.balance += reward;
+        player.projectWheelResolved = true;
+        player.projectResolved = true;
+        player.projectWheelInProgress = false;
+        player.projectWheel = {
+          ...currentWheel,
+          status: "resolved"
+        };
+        player.history[4] = player.balance;
+        player.transactions = player.transactions || [];
+        player.transactions.push({
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          time: timestamp(),
+          phase: 4,
+          type: "project-wheel",
+          amount: reward,
+          description: `Ruleta Proyecto X: ${player.projectWheel.label}`
+        });
+
+        pushLog(room, `${player.name} giró la ruleta de Proyecto X y obtuvo ${reward}.`);
+        finalizeProjectWheel(room, player, player.projectWheel);
+      }, 1800);
       return;
     }
 
@@ -806,29 +913,53 @@ io.on("connection", (socket) => {
       const selectedValue = typeof selected === "string" ? selected : selected.value;
       const reward = calculateProjectYReward(selectedValue);
 
-      player.balance += reward;
-      player.projectWheelResolved = true;
-      player.projectResolved = true;
       player.projectWheel = {
         type: "projectY",
+        scope: "individual",
+        status: "spinning",
         option: selectedValue,
         amount: reward,
-        label: typeof selected === "string" ? selected : selected.label
+        label: typeof selected === "string" ? selected : selected.label,
+        title: "Proyecto Y",
+        playerId: player.id,
+        playerName: player.name,
+        audience: player.name,
+        options,
+        selectedOption: selectedValue
       };
-      player.history[5] = player.balance;
-      player.transactions = player.transactions || [];
-      player.transactions.push({
-        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        time: timestamp(),
-        phase: 5,
-        type: "project-wheel",
-        amount: reward,
-        description: `Ruleta Proyecto Y: ${player.projectWheel.label}`
-      });
 
-      pushLog(room, `${player.name} giró la ruleta de Proyecto Y y obtuvo ${reward}.`);
-      publishRoom(room, { balances: true, ranking: true });
-      io.to(room.roomCode).emit("wheel-result", player.projectWheel);
+      player.projectWheelInProgress = true;
+      emitWheelEvent([room.adminSocketId, player.socketId], "wheel-start", player.projectWheel);
+
+      setTimeout(() => {
+        const currentWheel = player.projectWheel;
+
+        if (!currentWheel || currentWheel.status !== "spinning") {
+          return;
+        }
+
+        player.balance += reward;
+        player.projectWheelResolved = true;
+        player.projectResolved = true;
+        player.projectWheelInProgress = false;
+        player.projectWheel = {
+          ...currentWheel,
+          status: "resolved"
+        };
+        player.history[5] = player.balance;
+        player.transactions = player.transactions || [];
+        player.transactions.push({
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          time: timestamp(),
+          phase: 5,
+          type: "project-wheel",
+          amount: reward,
+          description: `Ruleta Proyecto Y: ${player.projectWheel.label}`
+        });
+
+        pushLog(room, `${player.name} giró la ruleta de Proyecto Y y obtuvo ${reward}.`);
+        finalizeProjectWheel(room, player, player.projectWheel);
+      }, 1800);
     }
   });
 
@@ -850,6 +981,18 @@ io.on("connection", (socket) => {
     const requiredSteps = PHASE_MAX_STEPS[room.phase] || 0;
 
     if ((room.phaseStep || 0) < requiredSteps) {
+      return;
+    }
+
+    if (room.phase === 2 && hasPendingStrategyWheels(room)) {
+      return;
+    }
+
+    if (room.phase === 4 && hasPendingProjectWheels(room, "X")) {
+      return;
+    }
+
+    if (room.phase === 5 && hasPendingProjectWheels(room, "Y")) {
       return;
     }
 
@@ -884,6 +1027,10 @@ io.on("connection", (socket) => {
     const requiredSteps = PHASE_MAX_STEPS[room.phase] || 0;
 
     if (requiredSteps === 0 || (room.phaseStep || 0) >= requiredSteps) {
+      return;
+    }
+
+    if (room.phase === 2 && hasPendingStrategyWheels(room)) {
       return;
     }
 
