@@ -30,7 +30,7 @@ const PHASE_NAMES = {
 const PHASE_MAX_STEPS = {
   0: 0,
   1: 1,
-  2: 3,
+  2: 2,
   3: 0,
   4: 1,
   5: 1,
@@ -357,12 +357,37 @@ function getMonthlyImpact(player, income, expenses, phase, specialEventActive) {
 }
 
 function settleProjectReturns(room, phase) {
+  let resolvedAny = false;
+
   room.players.forEach((player) => {
     if (player.projectResolved || player.projectReturnPhase !== phase) {
       return;
     }
 
     if (player.project === "Z") {
+      const returnWheel = {
+        type: "projectZ",
+        scope: "project",
+        status: "resolved",
+        title: "Retorno del Proyecto Z",
+        audience: "Usuarios con Proyecto Z",
+        amount: 4000,
+        label: "Retorno del Proyecto Z",
+        outcome: "Retorno del Proyecto Z",
+        options: [
+          {
+            label: "Retorno del Proyecto Z",
+            value: "project-z-return",
+            amount: 4000
+          }
+        ],
+        selectedOption: "project-z-return",
+        playerId: player.id,
+        playerName: player.name,
+        project: "Z"
+      };
+
+      emitWheelEvent([room.adminSocketId, player.socketId], "wheel-result", returnWheel);
       player.balance += 4000;
       player.projectResolved = true;
       player.history[phase] = player.balance;
@@ -376,8 +401,13 @@ function settleProjectReturns(room, phase) {
         description: `Retorno automático Proyecto Z`
       });
       pushLog(room, `${player.name} recupera el retorno automático de Proyecto Z.`);
+      resolvedAny = true;
     }
   });
+
+  if (resolvedAny) {
+    publishRoom(room, { balances: true, ranking: true });
+  }
 }
 
 function finalizeGlobalWheel(room, wheelType, resolvedWheel) {

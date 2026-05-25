@@ -108,7 +108,7 @@ const projectCards = [
 const phaseMaxSteps = {
   0: 0,
   1: 1,
-  2: 3,
+  2: 2,
   3: 0,
   4: 1,
   5: 1,
@@ -251,9 +251,76 @@ function formatMoney(value) {
   return new Intl.NumberFormat("es-CO").format(Number(value || 0));
 }
 
+function findCurrentPlayer(snapshot, identity) {
+  return snapshot?.players?.find(
+    (player) =>
+      identity &&
+      snapshot?.roomCode === identity.roomCode &&
+      ((identity.socketId && player.socketId === identity.socketId) ||
+        player.name.trim().toLowerCase() === identity.groupName?.trim().toLowerCase())
+  );
+}
+
+function wheelAppliesToPlayer(wheel, currentPlayer, identity) {
+  if (!wheel) {
+    return false;
+  }
+
+  if (identity?.role === "host") {
+    return true;
+  }
+
+  if (!currentPlayer) {
+    return false;
+  }
+
+  if (wheel.type === "strategyA") {
+    return currentPlayer.strategy === "A";
+  }
+
+  if (wheel.type === "strategyC") {
+    return currentPlayer.strategy === "C";
+  }
+
+  if (wheel.type === "projectZ") {
+    return currentPlayer.project === "Z";
+  }
+
+  if (wheel.type === "projectX") {
+    return currentPlayer.project === "X";
+  }
+
+  if (wheel.type === "projectY") {
+    return currentPlayer.project === "Y";
+  }
+
+  return true;
+}
+
 function App() {
   const game = useGameSocket();
   const [identity, setIdentity] = useState(loadIdentity);
+  const { activeWheel, clearActiveWheel, snapshot } = game;
+  const currentPlayer = findCurrentPlayer(snapshot, identity);
+  const visibleWheel = wheelAppliesToPlayer(activeWheel, currentPlayer, identity) ? activeWheel : null;
+
+  useEffect(() => {
+    if (!activeWheel) {
+      return;
+    }
+
+    if (identity?.role === "host") {
+      return;
+    }
+
+    if (!currentPlayer) {
+      return;
+    }
+
+    if (!wheelAppliesToPlayer(activeWheel, currentPlayer, identity)) {
+      clearActiveWheel();
+    }
+  }, [activeWheel, clearActiveWheel, currentPlayer, identity]);
 
   const persistIdentity = (nextIdentity) => {
     setIdentity(nextIdentity);
@@ -264,7 +331,7 @@ function App() {
     <BrowserRouter>
       <div className="app-shell">
         <Header connected={game.connected} snapshot={game.snapshot} />
-        <WheelModal wheel={game.activeWheel} formatMoney={formatMoney} onClose={game.clearActiveWheel} />
+        <WheelModal wheel={visibleWheel} formatMoney={formatMoney} onClose={clearActiveWheel} />
         <main className="app-main">
           <Routes>
             <Route path="/" element={<LandingPage snapshot={game.snapshot} />} />
@@ -480,6 +547,8 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   const hasPendingProjectWheel =
     (currentPhase === 4 && (snapshot?.players || []).some((player) => player.project === "X" && !player.projectWheelResolved)) ||
     (currentPhase === 5 && (snapshot?.players || []).some((player) => player.project === "Y" && !player.projectWheelResolved));
+  const showPhase2MonthlyControl = currentPhase === 2 && currentStep >= 1;
+  const showPhase45MonthlyControl = (currentPhase === 4 || currentPhase === 5) && currentStep === 0;
 
   const strategyAPlayers = snapshot?.players?.filter((player) => player.strategy === "A") || [];
   const strategyCPlayers = snapshot?.players?.filter((player) => player.strategy === "C") || [];
@@ -490,7 +559,6 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   const canStartGame = !isStarted;
   const canGoNextStep = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep < maxStepForPhase && !isStrategyWheelBusy;
   const canGoNextPhase = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep >= maxStepForPhase && !hasPendingProjectWheel;
-  const canApplyMonth = currentPhase >= 2 && currentPhase <= 5;
   const monthlyForCurrentPhase = snapshot?.monthlyInputs?.[currentPhase] || null;
 
   return (
@@ -573,7 +641,43 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
         </article>
       )}
 
-      {canApplyMonth && (currentPhase !== 2 || currentStep === 0) && !((currentPhase === 4 || currentPhase === 5) && currentStep >= 1) ? (
+      {showPhase2MonthlyControl ? (
+        <article className="panel">
+          <p className="eyebrow">Control financiero fase 2</p>
+          {currentStep === 1 && !hasMonthlyApplied ? (
+            <>
+              <div className="form-grid form-grid--inline">
+                <label>
+                  Ingresos del mes
+                  <input type="number" value={income} onChange={(event) => setIncome(event.target.value)} />
+                </label>
+                <label>
+                  Gastos del mes
+                  <input type="number" value={expenses} onChange={(event) => setExpenses(event.target.value)} />
+                </label>
+              </div>
+              <div className="button-row">
+                <button className="button button-primary" type="button" onClick={handleApplyMonthlyValues} disabled={hasMonthlyApplied}>
+                  Aplicar ingresos y gastos
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="callout">
+              Admin seleccionó ingresos {formatMoney(monthlyForCurrentPhase?.income || 0)} y gastos {formatMoney(monthlyForCurrentPhase?.expenses || 0)}.
+            </div>
+          )}
+          {currentStep === 1 && hasMonthlyApplied ? (
+            <div className="button-row">
+              <button className="button button-primary" type="button" onClick={() => emitNextStep(currentRoom)}>
+                Siguiente paso: habilitar selección de proyectos
+              </button>
+            </div>
+          ) : null}
+        </article>
+      ) : null}
+
+      {showPhase45MonthlyControl ? (
         <article className="panel">
           <p className="eyebrow">Control financiero</p>
           <div className="form-grid form-grid--inline">
@@ -597,22 +701,6 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
               Aplicar ingresos y gastos
             </button>
           </div>
-        </article>
-      ) : null}
-
-      {currentPhase === 2 && currentStep >= 2 ? (
-        <article className="panel panel-wide">
-          <p className="eyebrow">Confirmación financiera de fase 2</p>
-          <div className="callout">
-            Admin seleccionó ingresos {formatMoney(monthlyForCurrentPhase?.income || 0)} y gastos {formatMoney(monthlyForCurrentPhase?.expenses || 0)}.
-          </div>
-          {currentStep === 1 ? (
-            <div className="button-row">
-              <button className="button button-primary" type="button" onClick={() => emitNextStep(currentRoom)}>
-                Siguiente paso: habilitar selección de proyectos
-              </button>
-            </div>
-          ) : null}
         </article>
       ) : null}
 
@@ -836,34 +924,12 @@ function GamePage({ snapshot, lastWheel, emitStrategy, emitProject, identity, fo
   const phase = snapshot?.phase ?? 0;
   const phaseStep = snapshot?.phaseStep ?? 0;
   const monthlyForPhase2 = snapshot?.monthlyInputs?.[2] || null;
-  const currentPlayer = snapshot?.players?.find(
-    (player) =>
-      identity &&
-      snapshot?.roomCode === identity.roomCode &&
-      ((identity.socketId && player.socketId === identity.socketId) ||
-        player.name.trim().toLowerCase() === identity.groupName.trim().toLowerCase())
-  );
+  const currentPlayer = findCurrentPlayer(snapshot, identity);
+  const visibleLastWheel = wheelAppliesToPlayer(lastWheel, currentPlayer, identity) ? lastWheel : null;
 
   return (
     <section className={`content-grid content-grid--game phase-view phase-view--${phase}`}>
       <PhaseBanner phase={phase} role="player" />
-
-      <article className="panel panel-form">
-        <p className="eyebrow">Game</p>
-        <h2>Tablero del grupo</h2>
-        <p className="muted">Sala {roomCode}</p>
-        {currentPlayer ? (
-          <div className="stack">
-            <Metric label="Saldo actual" value={formatMoney(currentPlayer.balance)} />
-            <Metric label="Estrategia" value={currentPlayer.strategy || "Pendiente"} />
-            <Metric label="Proyecto" value={currentPlayer.project || "Pendiente"} />
-            <Metric label="Fase actual" value={snapshot ? phaseTitles[snapshot.phase] : "Pendiente"} />
-            <Metric label="Estado" value={currentPlayer.connected ? "Conectado" : "Desconectado"} />
-          </div>
-        ) : (
-          <p className="empty-state">Conéctate con un grupo desde /join para ver tu tablero.</p>
-        )}
-      </article>
 
       {phase === 2 && phaseStep === 0 ? (
         <article className="panel panel-wide">
@@ -934,6 +1000,22 @@ function GamePage({ snapshot, lastWheel, emitStrategy, emitProject, identity, fo
         </article>
       ) : null}
 
+      <article className="panel panel-wide">
+        <p className="eyebrow">Tablero del grupo</p>
+        <p className="muted">Sala {roomCode}</p>
+        {currentPlayer ? (
+          <div className="stack">
+            <Metric label="Saldo actual" value={formatMoney(currentPlayer.balance)} />
+            <Metric label="Estrategia" value={currentPlayer.strategy || "Pendiente"} />
+            <Metric label="Proyecto" value={currentPlayer.project || "Pendiente"} />
+            <Metric label="Fase actual" value={snapshot ? phaseTitles[snapshot.phase] : "Pendiente"} />
+            <Metric label="Estado" value={currentPlayer.connected ? "Conectado" : "Desconectado"} />
+          </div>
+        ) : (
+          <p className="empty-state">Conéctate con un grupo desde /join para ver tu tablero.</p>
+        )}
+      </article>
+
       {(phase === 3 || phase === 4 || phase === 5) ? (
         <article className="panel panel-wide">
           <p className="eyebrow">Operación de fase</p>
@@ -966,9 +1048,9 @@ function GamePage({ snapshot, lastWheel, emitStrategy, emitProject, identity, fo
       <article className="panel panel-wide">
         <p className="eyebrow">Última ruleta</p>
         <div className="callout">
-          {lastWheel ? (
+          {visibleLastWheel ? (
             <span>
-              <strong>{lastWheel.outcome || lastWheel.label || lastWheel.option}</strong> ({lastWheel.amount > 0 ? "+" : ""}{formatMoney(lastWheel.amount)})
+              <strong>{visibleLastWheel.outcome || visibleLastWheel.label || visibleLastWheel.option}</strong> ({visibleLastWheel.amount > 0 ? "+" : ""}{formatMoney(visibleLastWheel.amount)})
             </span>
           ) : (
             <span>Sin ruletas ejecutadas aún.</span>
