@@ -108,7 +108,7 @@ const projectCards = [
 const phaseMaxSteps = {
   0: 0,
   1: 1,
-  2: 2,
+  2: 3,
   3: 0,
   4: 1,
   5: 1,
@@ -170,6 +170,28 @@ function useGameSocket() {
       setLastWheel(payload);
     };
 
+    const handleRiskUpdated = (payload) => {
+      setSnapshot((current) => {
+        if (!current || !payload || !payload.risks) return current;
+
+        const updatedPlayers = (current.players || []).map((p) => {
+          const found = payload.risks.find((r) => r.playerId === p.id);
+          if (found) {
+            return {
+              ...p,
+              currentProjectRisk: found.risk
+            };
+          }
+          return p;
+        });
+
+        return {
+          ...current,
+          players: updatedPlayers
+        };
+      });
+    };
+
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.on("teams-updated", handleSnapshot);
@@ -202,6 +224,7 @@ function useGameSocket() {
     });
     socket.on("wheel-start", handleWheelStart);
     socket.on("wheel-result", handleWheel);
+    socket.on("risk-updated", handleRiskUpdated);
 
     return () => {
       socket.off("connect", handleConnect);
@@ -214,6 +237,7 @@ function useGameSocket() {
       socket.off("phase-updated");
       socket.off("wheel-start", handleWheelStart);
       socket.off("wheel-result", handleWheel);
+      socket.off("risk-updated", handleRiskUpdated);
     };
   }, []);
 
@@ -225,6 +249,8 @@ function useGameSocket() {
     socket.emit("submit-strategy", { roomCode, playerId, strategy });
   const emitProject = (roomCode, playerId, project) =>
     socket.emit("submit-project", { roomCode, playerId, project });
+  const emitDecision = (roomCode, playerId, decision, cb) =>
+    socket.emit("submit-decision", { roomCode, playerId, decision }, cb);
   const emitMonthValues = (roomCode, income, expenses, specialEventActive) =>
     socket.emit("submit-month-values", { roomCode, income, expenses, specialEventActive });
   const emitWheel = (payload) => socket.emit("spin-wheel", payload);
@@ -242,6 +268,7 @@ function useGameSocket() {
     emitNextStep,
     emitStrategy,
     emitProject,
+    emitDecision,
     emitMonthValues,
     emitWheel
   };
@@ -294,15 +321,223 @@ function wheelAppliesToPlayer(wheel, currentPlayer, identity) {
     return currentPlayer.project === "Y";
   }
 
+  if (wheel.type === "projectReturn") {
+    return currentPlayer.projectReturnPhase === wheel.returnPhase || currentPlayer.id === wheel.playerId;
+  }
+
   return true;
+}
+
+function allProjectDecisionsSubmitted(snapshot) {
+  return Boolean(
+    snapshot?.players?.filter((player) => player.role === "player").length &&
+      snapshot.players.filter((player) => player.role === "player").every((player) => player.projectDecisionSubmitted)
+  );
+}
+
+function clampNumber(value, min, max) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) {
+    return min;
+  }
+
+  return Math.min(max, Math.max(min, numericValue));
+}
+
+function getWheelCategory(option = {}) {
+  const label = String(option.label || option.value || "").toLowerCase();
+
+  if (option.category) {
+    return option.category;
+  }
+
+  if (label.includes("neutral") || label.includes("normal")) {
+    return "neutral";
+  }
+
+  if (label.includes("good") || label.includes("retorno +") || Number(option.amount || 0) > 0) {
+    return "good";
+  }
+
+  return "bad";
+}
+
+function groupWheelOptions(options = []) {
+  return options.reduce(
+    (accumulator, option) => {
+      const category = getWheelCategory(option);
+      accumulator[category].push(option);
+      return accumulator;
+    },
+    { good: [], neutral: [], bad: [] }
+  );
+}
+
+function splitBadProjectSlots(badSlots) {
+  if (badSlots <= 0) {
+    return { half: 0, third: 0, zero: 0 };
+  }
+
+  let half = Math.round(badSlots * 0.6);
+  let third = Math.round(badSlots * 0.3);
+  let zero = badSlots - half - third;
+
+  if (zero <= 0) {
+    zero = 1;
+
+    if (half >= third && half > 0) {
+      half -= 1;
+    } else if (third > 0) {
+      third -= 1;
+    }
+  }
+
+  return {
+    half,
+    third,
+    zero
+  };
+}
+
+function buildProjectRiskWheelOptions(expectedReturn, risk) {
+  const totalSlots = 10;
+  const normalizedRisk = Math.max(0, Math.min(60, Number(risk) || 0));
+  const riskySlots = Math.max(0, Math.min(totalSlots, Math.round(normalizedRisk / 10)));
+  const goodSlots = riskySlots > 0 ? 1 : 0;
+  const badSlots = Math.max(0, riskySlots - goodSlots);
+  const neutralSlots = totalSlots - riskySlots;
+  const badSplit = splitBadProjectSlots(badSlots);
+  const amount = Math.max(0, Number(expectedReturn) || 0);
+
+  const options = [];
+
+  for (let index = 0; index < goodSlots; index += 1) {
+    options.push({ label: "Retorno +10%", value: "good-plus-10", amount: Math.round(amount * 1.1), category: "good" });
+  }
+
+  for (let index = 0; index < badSplit.half; index += 1) {
+    options.push({ label: "Retorno / 2", value: "bad-half", amount: Math.round(amount / 2), category: "bad" });
+  }
+
+  for (let index = 0; index < badSplit.third; index += 1) {
+    options.push({ label: "Retorno / 3", value: "bad-third", amount: Math.round(amount / 3), category: "bad" });
+  }
+
+  for (let index = 0; index < badSplit.zero; index += 1) {
+    options.push({ label: "Retorno = 0", value: "bad-zero", amount: 0, category: "bad" });
+  }
+
+  for (let index = 0; index < neutralSlots; index += 1) {
+    options.push({ label: "Retorno neutral", value: "neutral", amount, category: "neutral" });
+  }
+
+  while (options.length < totalSlots) {
+    options.push({ label: "Retorno neutral", value: "neutral", amount, category: "neutral" });
+  }
+
+  return options.slice(0, totalSlots);
+}
+
+function buildPreviewWheel(request, snapshot) {
+  if (!request) {
+    return null;
+  }
+
+  const player = snapshot?.players?.find((entry) => entry.id === request.playerId) || null;
+  const lastCustomProject = player?.customProjects?.slice(-1)[0] || null;
+  const risk = Number(player?.currentProjectRisk || 0);
+
+  if (request.wheelType === "strategyA") {
+    return {
+      title: "Marketing",
+      scope: "global",
+      options: [
+        { label: "Sí hubo crisis", value: "crisis", amount: 500, category: "bad" },
+        { label: "No hubo crisis", value: "normal", amount: 3000, category: "good" }
+      ]
+    };
+  }
+
+  if (request.wheelType === "strategyC") {
+    return {
+      title: "Innovación",
+      scope: "global",
+      options: [
+        { label: "Innovación exitosa", value: "success", amount: 5000, category: "good" },
+        { label: "Innovación fallida", value: "fail", amount: 0, category: "bad" }
+      ]
+    };
+  }
+
+  if (request.wheelType === "projectX") {
+    return {
+      title: "Proyecto X",
+      scope: "individual",
+      playerName: player?.name || "N/A",
+      options: [
+        { label: "Retorno reducido a la mitad", value: "half", amount: 3500, category: "bad" },
+        { label: "Retorno reducido a 2000", value: "two-thousand", amount: 2000, category: "bad" },
+        { label: "Retorno de 0", value: "zero", amount: 0, category: "bad" },
+        { label: "Retorno +1000", value: "plus-one-thousand", amount: 8000, category: "good" },
+        { label: "Resultado normal", value: "normal", amount: 7000, category: "neutral" }
+      ]
+    };
+  }
+
+  if (request.wheelType === "projectY") {
+    return {
+      title: "Proyecto Y",
+      scope: "individual",
+      playerName: player?.name || "N/A",
+      options: [
+        { label: "Descuento 3000", value: "discount-3000", amount: 8000, category: "bad" },
+        { label: "Descuento 5000", value: "discount-5000", amount: 6000, category: "bad" },
+        { label: "Descuento 8000", value: "discount-8000", amount: 3000, category: "bad" },
+        { label: "Descuento 11000", value: "discount-11000", amount: 0, category: "bad" },
+        { label: "Retorno +2000", value: "plus-2000", amount: 13000, category: "good" },
+        { label: "Resultado normal", value: "normal", amount: 11000, category: "neutral" }
+      ]
+    };
+  }
+
+  if (request.wheelType === "projectReturn") {
+    const expectedReturn = Number(lastCustomProject?.expectedReturn || 0);
+    const options = buildProjectRiskWheelOptions(expectedReturn, risk);
+
+    return {
+      title: `Retorno de ${lastCustomProject?.name || "proyecto"}`,
+      scope: "individual",
+      playerName: player?.name || "N/A",
+      risk,
+      options: options.length ? options : [{ label: "Retorno neutral", value: "neutral", amount: expectedReturn, category: "neutral" }]
+    };
+  }
+
+  return null;
+}
+
+function getWheelResolvedIndex(wheel) {
+  const options = wheel?.options || [];
+  if (!options.length) {
+    return 0;
+  }
+
+  const selectedValue = wheel?.selectedOption || wheel?.option;
+  const selectedIndex = options.findIndex((option) => option.value === selectedValue);
+  return selectedIndex >= 0 ? selectedIndex : 0;
 }
 
 function App() {
   const game = useGameSocket();
   const [identity, setIdentity] = useState(loadIdentity);
+  const [winnerVisible, setWinnerVisible] = useState(true);
   const { activeWheel, clearActiveWheel, snapshot } = game;
   const currentPlayer = findCurrentPlayer(snapshot, identity);
   const visibleWheel = wheelAppliesToPlayer(activeWheel, currentPlayer, identity) ? activeWheel : null;
+
+  useEffect(() => {
+    setWinnerVisible(snapshot?.phase === 6);
+  }, [snapshot?.phase, snapshot?.winner?.id]);
 
   useEffect(() => {
     if (!activeWheel) {
@@ -332,6 +567,13 @@ function App() {
       <div className="app-shell">
         <Header connected={game.connected} snapshot={game.snapshot} />
         <WheelModal wheel={visibleWheel} formatMoney={formatMoney} onClose={clearActiveWheel} />
+        <WinnerModal
+          winner={game.snapshot?.winner}
+          phase={game.snapshot?.phase}
+          isOpen={winnerVisible}
+          onClose={() => setWinnerVisible(false)}
+          formatMoney={formatMoney}
+        />
         <main className="app-main">
           <Routes>
             <Route path="/" element={<LandingPage snapshot={game.snapshot} />} />
@@ -371,6 +613,7 @@ function App() {
                   lastWheel={game.lastWheel}
                   emitStrategy={game.emitStrategy}
                   emitProject={game.emitProject}
+                  emitDecision={game.emitDecision}
                   identity={identity}
                   formatMoney={formatMoney}
                 />
@@ -523,6 +766,7 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   const [adminUnlocked, setAdminUnlocked] = useState(false);
   const [adminPasscode, setAdminPasscode] = useState("");
   const [passError, setPassError] = useState("");
+  const [wheelPreview, setWheelPreview] = useState(null);
 
   const currentRoom = snapshot?.roomCode || roomCode;
 
@@ -544,11 +788,15 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   const currentStep = snapshot?.phaseStep ?? 0;
   const hasMonthlyApplied = snapshot?.monthlyInputs?.[currentPhase] !== undefined;
   const isStrategyWheelBusy = snapshot?.wheels?.strategyA?.status === "spinning" || snapshot?.wheels?.strategyC?.status === "spinning";
+  const allProjectSubmitted = allProjectDecisionsSubmitted(snapshot);
   const hasPendingProjectWheel =
     (currentPhase === 4 && (snapshot?.players || []).some((player) => player.project === "X" && !player.projectWheelResolved)) ||
     (currentPhase === 5 && (snapshot?.players || []).some((player) => player.project === "Y" && !player.projectWheelResolved));
   const showPhase2MonthlyControl = currentPhase === 2 && currentStep >= 1;
   const showPhase45MonthlyControl = (currentPhase === 4 || currentPhase === 5) && currentStep === 0;
+  const pendingProjectReturns = (snapshot?.players || []).filter(
+    (player) => player.role === "player" && player.projectReturnPhase === currentPhase && !player.projectWheelResolved && player.projectDecisionSubmitted
+  );
 
   const strategyAPlayers = snapshot?.players?.filter((player) => player.strategy === "A") || [];
   const strategyCPlayers = snapshot?.players?.filter((player) => player.strategy === "C") || [];
@@ -557,13 +805,36 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   const maxStepForPhase = phaseMaxSteps[currentPhase] ?? 0;
   const isStarted = Boolean(snapshot?.started);
   const canStartGame = !isStarted;
-  const canGoNextStep = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep < maxStepForPhase && !isStrategyWheelBusy;
-  const canGoNextPhase = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep >= maxStepForPhase && !hasPendingProjectWheel;
+  const canGoNextStep =
+    isStarted &&
+    currentPhase > 0 &&
+    currentPhase < 6 &&
+    currentStep < maxStepForPhase &&
+    !isStrategyWheelBusy &&
+    !(currentPhase === 2 && currentStep === 2 && !allProjectSubmitted);
+  const canGoNextPhase = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep >= maxStepForPhase && !hasPendingProjectWheel && !pendingProjectReturns.length;
   const monthlyForCurrentPhase = snapshot?.monthlyInputs?.[currentPhase] || null;
+
+  const openWheelPreview = (payload) => {
+    setWheelPreview(payload);
+  };
+
+  const closeWheelPreview = () => {
+    setWheelPreview(null);
+  };
 
   return (
     <section className={`content-grid content-grid--host phase-view phase-view--${currentPhase}`}>
       <PhaseBanner phase={currentPhase} role="admin" />
+      <WheelPreviewModal
+        wheelRequest={wheelPreview}
+        snapshot={snapshot}
+        onClose={closeWheelPreview}
+        onSpin={(payload) => {
+          emitWheel(payload);
+          closeWheelPreview();
+        }}
+      />
 
       {!adminUnlocked ? (
         <article className="panel panel-form">
@@ -737,7 +1008,7 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
                 {(snapshot?.players || []).map((player) => (
                   <tr key={player.id}>
                     <td>{player.name}</td>
-                    <td>{player.strategy || "Pendiente"}</td>
+                    <td>{player.strategy || "-"}</td>
                     <td>{player.strategy ? "Votó" : "Esperando"}</td>
                   </tr>
                 ))}
@@ -754,23 +1025,15 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
             <div className="wheel-card">
               <h3>Marketing</h3>
               <p>{strategyAPlayers.length} grupos con estrategia A</p>
-              <button
-                className="button button-secondary"
-                type="button"
-                onClick={() => emitWheel({ roomCode: currentRoom, wheelType: "strategyA", option: Math.random() < 0.5 ? "crisis" : "normal" })}
-              >
-                Lanzar ruleta global
+              <button className="button button-secondary" type="button" onClick={() => openWheelPreview({ roomCode: currentRoom, wheelType: "strategyA" })}>
+                Abrir ruleta
               </button>
             </div>
             <div className="wheel-card">
               <h3>Innovación</h3>
               <p>{strategyCPlayers.length} grupos con estrategia C</p>
-              <button
-                className="button button-secondary"
-                type="button"
-                onClick={() => emitWheel({ roomCode: currentRoom, wheelType: "strategyC", option: Math.random() < 0.5 ? "success" : "fail" })}
-              >
-                Lanzar ruleta global
+              <button className="button button-secondary" type="button" onClick={() => openWheelPreview({ roomCode: currentRoom, wheelType: "strategyC" })}>
+                Abrir ruleta
               </button>
             </div>
           </div>
@@ -792,6 +1055,8 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
                   <th>Grupo</th>
                   <th>Estrategia</th>
                   <th>Proyecto</th>
+                  <th>Retorno en</th>
+                  <th>Riesgo</th>
                 </tr>
               </thead>
               <tbody>
@@ -800,6 +1065,75 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
                     <td>{player.name}</td>
                     <td>{player.strategy || "-"}</td>
                     <td>{player.project || "Pendiente"}</td>
+                    <td>{player.projectReturnPhase || "-"}</td>
+                    <td>{player.currentProjectRisk || 0}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      ) : null}
+
+      {currentPhase === 2 && currentStep >= 3 ? (
+        <article className="panel panel-wide">
+          <p className="eyebrow">Tabla de riesgo</p>
+          <div className="callout">
+            {allProjectSubmitted
+              ? "Todos los equipos enviaron sus proyectos. Usa Siguiente fase para continuar al retorno correspondiente."
+              : "Aún faltan equipos por enviar su proyecto."}
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Grupo</th>
+                  <th>Proyecto</th>
+                  <th>Fase retorno</th>
+                  <th>Riesgo</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(snapshot?.players || []).map((player) => (
+                  <tr key={player.id}>
+                    <td>{player.name}</td>
+                    <td>{player.project || "Pendiente"}</td>
+                    <td>{player.projectReturnPhase || "-"}</td>
+                    <td>{player.currentProjectRisk != null ? `${player.currentProjectRisk}%` : "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      ) : null}
+
+      {[3, 4, 5].includes(currentPhase) && pendingProjectReturns.length ? (
+        <article className="panel panel-wide">
+          <p className="eyebrow">Retornos de proyecto</p>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Grupo</th>
+                  <th>Proyecto</th>
+                  <th>Fase retorno</th>
+                  <th>Riesgo</th>
+                  <th>Acción</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pendingProjectReturns.map((player) => (
+                  <tr key={player.id}>
+                    <td>{player.name}</td>
+                    <td>{player.project || player.name}</td>
+                    <td>{player.projectReturnPhase}</td>
+                    <td>{player.currentProjectRisk || 0}%</td>
+                    <td>
+                      <button className="button button-secondary" type="button" onClick={() => openWheelPreview({ roomCode: currentRoom, wheelType: "projectReturn", playerId: player.id })}>
+                        Abrir ruleta de {player.name} con {player.currentProjectRisk || 0}% de riesgo
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -816,15 +1150,8 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
               <h3>Proyecto X</h3>
               <p>{projectXPlayers.length} grupos pendientes.</p>
               {projectXPlayers.map((player) => (
-                <button
-                  key={player.id}
-                  className="button button-secondary button-block"
-                  type="button"
-                  onClick={() =>
-                    emitWheel({ roomCode: currentRoom, wheelType: "projectX", playerId: player.id })
-                  }
-                >
-                  Girar para {player.name}
+                <button key={player.id} className="button button-secondary button-block" type="button" onClick={() => openWheelPreview({ roomCode: currentRoom, wheelType: "projectX", playerId: player.id })}>
+                  Abrir ruleta de {player.name}
                 </button>
               ))}
             </div>
@@ -861,22 +1188,15 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
               <h3>Proyecto Y</h3>
               <p>{projectYPlayers.length} grupos pendientes.</p>
               {projectYPlayers.map((player) => (
-                <button
-                  key={player.id}
-                  className="button button-secondary button-block"
-                  type="button"
-                  onClick={() =>
-                    emitWheel({ roomCode: currentRoom, wheelType: "projectY", playerId: player.id })
-                  }
-                >
-                  Girar para {player.name}
+                <button key={player.id} className="button button-secondary button-block" type="button" onClick={() => openWheelPreview({ roomCode: currentRoom, wheelType: "projectY", playerId: player.id })}>
+                  Abrir ruleta de {player.name}
                 </button>
               ))}
             </div>
           </div>
 
           <div className="table-wrap">
-            <table >
+            <table>
               <thead>
                 <tr>
                   <th>Grupo</th>
@@ -918,13 +1238,14 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   );
 }
 
-function GamePage({ snapshot, lastWheel, emitStrategy, emitProject, identity, formatMoney }) {
+function GamePage({ snapshot, lastWheel, emitStrategy, emitProject, emitDecision, identity, formatMoney }) {
   const [searchParams] = useSearchParams();
   const roomCode = identity?.roomCode || searchParams.get("room") || snapshot?.roomCode || "AULA";
   const phase = snapshot?.phase ?? 0;
   const phaseStep = snapshot?.phaseStep ?? 0;
   const monthlyForPhase2 = snapshot?.monthlyInputs?.[2] || null;
   const currentPlayer = findCurrentPlayer(snapshot, identity);
+  const allProjectSubmitted = allProjectDecisionsSubmitted(snapshot);
   const visibleLastWheel = wheelAppliesToPlayer(lastWheel, currentPlayer, identity) ? lastWheel : null;
 
   return (
@@ -983,20 +1304,27 @@ function GamePage({ snapshot, lastWheel, emitStrategy, emitProject, identity, fo
         </article>
       ) : null}
 
-      {phase === 2 && phaseStep >= 2 ? (
+      {phase === 2 && phaseStep >= 2 && !allProjectSubmitted ? (
         <article className="panel panel-wide">
           <p className="eyebrow">Inversión del grupo</p>
-          <DecisionSection
-            title="Proyectos"
-            items={projectCards}
-            onAction={(item) => currentPlayer && emitProject(snapshot?.roomCode, currentPlayer.id, item.id)}
-            actionLabel="Seleccionar proyecto"
+          <CustomDecisionForm
             disabled={!currentPlayer || currentPlayer.project}
+            balance={currentPlayer?.balance || 0}
             phase={snapshot?.phase}
             requiredPhase={2}
             currentStep={snapshot?.phaseStep}
             requiredStep={2}
+            onSubmit={(decision, cb) => currentPlayer && emitDecision(snapshot?.roomCode, currentPlayer.id, decision, cb)}
           />
+        </article>
+      ) : null}
+
+      {phase === 2 && phaseStep >= 2 && allProjectSubmitted ? (
+        <article className="panel panel-wide">
+          <p className="eyebrow">Proyectos enviados</p>
+          <div className="callout callout-success">
+            Todos los equipos ya enviaron su proyecto. El administrador mostrará el riesgo y luego avanzará a la siguiente fase.
+          </div>
         </article>
       ) : null}
 
@@ -1008,6 +1336,8 @@ function GamePage({ snapshot, lastWheel, emitStrategy, emitProject, identity, fo
             <Metric label="Saldo actual" value={formatMoney(currentPlayer.balance)} />
             <Metric label="Estrategia" value={currentPlayer.strategy || "Pendiente"} />
             <Metric label="Proyecto" value={currentPlayer.project || "Pendiente"} />
+            <Metric label="Riesgo proyecto" value={currentPlayer.currentProjectRisk != null ? `${currentPlayer.currentProjectRisk}%` : "Pendiente"} />
+            <Metric label="Fase retorno" value={currentPlayer.projectReturnPhase || "Pendiente"} />
             <Metric label="Fase actual" value={snapshot ? phaseTitles[snapshot.phase] : "Pendiente"} />
             <Metric label="Estado" value={currentPlayer.connected ? "Conectado" : "Desconectado"} />
           </div>
@@ -1084,72 +1414,70 @@ function WheelModal({ wheel, formatMoney, onClose }) {
   const [displayedIndex, setDisplayedIndex] = useState(0);
 
   useEffect(() => {
-    if (!wheel || wheel.status !== "resolved") {
+    if (!wheel || !wheel.options || !wheel.options.length) {
       return undefined;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      onClose();
-    }, 10000);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [wheel, onClose]);
-
-  useEffect(() => {
-    if (!wheel) {
-      return undefined;
-    }
-
-    const options = wheel.options || [];
-
-    if (!options.length) {
-      return undefined;
-    }
-
-    if (wheel.status === "resolved") {
-      const selectedIndex = Math.max(
-        0,
-        options.findIndex((option) => option.value === (wheel.selectedOption || wheel.option))
-      );
-
-      const frameId = window.requestAnimationFrame(() => {
-        setDisplayedIndex(selectedIndex);
-      });
-
-      return () => window.cancelAnimationFrame(frameId);
     }
 
     if (wheel.status === "spinning") {
       let currentIndex = 0;
-
       const intervalId = window.setInterval(() => {
-        currentIndex = (currentIndex + 1) % options.length;
+        currentIndex = (currentIndex + 1) % wheel.options.length;
         setDisplayedIndex(currentIndex);
       }, 90);
 
       return () => window.clearInterval(intervalId);
     }
 
-      return undefined;
-  }, [wheel]);
+    if (wheel.status === "resolved") {
+      const selectedIndex = getWheelResolvedIndex(wheel);
+      const frameId = window.requestAnimationFrame(() => setDisplayedIndex(selectedIndex));
+
+      const timeoutId = window.setTimeout(() => {
+        onClose();
+      }, 10000);
+
+      return () => {
+        window.cancelAnimationFrame(frameId);
+        window.clearTimeout(timeoutId);
+      };
+    }
+
+    return undefined;
+  }, [wheel, onClose]);
 
   if (!wheel) {
     return null;
   }
 
+  const options = wheel.options || [];
   const title = wheel.title || (wheel.type === "strategyA" ? "Marketing" : wheel.type === "strategyC" ? "Innovación" : wheel.type === "projectX" ? "Proyecto X" : wheel.type === "projectY" ? "Proyecto Y" : "Ruleta");
   const scopeText = wheel.scope === "individual" ? `Jugador: ${wheel.playerName || wheel.audience || "N/A"}` : "Afecta a toda la sala";
   const resultText = wheel.outcome || wheel.label || wheel.option || "Pendiente";
-  const options = wheel.options || [];
-  const activeOption = options.length ? options[displayedIndex % options.length] : null;
-  const activeOptionLabel = wheel.status === "resolved" ? resultText : activeOption?.label || "Girando";
-  const activeOptionAmount = wheel.status === "resolved" ? wheel.amount || 0 : activeOption?.amount ?? 0;
   const confettiPieces = wheel.status === "resolved" ? Array.from({ length: 14 }, (_, index) => index) : [];
+  const activeIndex = wheel.status === "resolved" ? getWheelResolvedIndex(wheel) : displayedIndex % Math.max(1, options.length);
+  const activeOption = options[activeIndex] || options[0] || null;
 
   return (
     <div className="wheel-modal-backdrop" role="dialog" aria-modal="true" aria-label="Resultado de ruleta">
       <section className="wheel-modal panel">
-        <div className={`wheel-modal__disc ${wheel.status === "spinning" ? "is-spinning" : "is-resolved"}`} aria-hidden="true">
+        <div className="wheel-modal__wheel-shell" aria-hidden="true">
+          <div className="wheel-modal__pointer" />
+          <div className={`wheel-modal__disc ${wheel.status === "spinning" ? "is-spinning" : "is-resolved"}`}>
+            <div className="wheel-modal__disc-core">
+              <span className="wheel-modal__status">{wheel.status === "spinning" ? "Girando" : "Cayó"}</span>
+              <strong className="wheel-modal__option is-settled">{wheel.status === "resolved" ? resultText : activeOption?.label || "Girando"}</strong>
+              <span className="wheel-modal__amount">
+                {wheel.status === "resolved" ? `${wheel.amount >= 0 ? "+" : ""}${formatMoney(wheel.amount || 0)}` : `${options.length} opciones`}
+              </span>
+            </div>
+          </div>
+          <div className="wheel-modal__wheel-core wheel-modal__wheel-core--hidden">
+            <span className="wheel-modal__status">{wheel.status === "spinning" ? "Girando" : "Cayó"}</span>
+            <strong className="wheel-modal__option is-settled">{wheel.status === "resolved" ? resultText : activeOption?.label || "Girando"}</strong>
+            <span className="wheel-modal__amount">
+              {wheel.status === "resolved" ? `${wheel.amount >= 0 ? "+" : ""}${formatMoney(wheel.amount || 0)}` : `${options.length} opciones`}
+            </span>
+          </div>
           {confettiPieces.length ? (
             <div className="wheel-modal__confetti">
               {confettiPieces.map((piece) => (
@@ -1157,15 +1485,6 @@ function WheelModal({ wheel, formatMoney, onClose }) {
               ))}
             </div>
           ) : null}
-          <div className="wheel-modal__disc-core">
-            <span className="wheel-modal__status">{wheel.status === "spinning" ? "Girando" : "Cayó"}</span>
-            <strong className={`wheel-modal__option ${wheel.status === "resolved" ? "is-settled" : "is-rolling"}`}>
-              {activeOptionLabel}
-            </strong>
-            <span className="wheel-modal__amount">
-              {activeOptionAmount >= 0 ? "+" : ""}{formatMoney(activeOptionAmount)}
-            </span>
-          </div>
         </div>
         <div className="wheel-modal__content">
           <p className="eyebrow">Resolución de ruleta</p>
@@ -1187,8 +1506,129 @@ function WheelModal({ wheel, formatMoney, onClose }) {
               </button>
             ) : null}
           </div>
+          <WheelOptionSections options={options} />
         </div>
       </section>
+    </div>
+  );
+}
+
+function WheelPreviewModal({ wheelRequest, snapshot, onClose, onSpin }) {
+  const previewWheel = buildPreviewWheel(wheelRequest, snapshot);
+
+  if (!wheelRequest || !previewWheel) {
+    return null;
+  }
+
+  const options = previewWheel.options || [];
+  return (
+    <div className="wheel-modal-backdrop" role="dialog" aria-modal="true" aria-label="Vista previa de ruleta">
+      <section className="wheel-modal panel">
+        <div className="wheel-modal__wheel-shell" aria-hidden="true">
+          <div className="wheel-modal__pointer" />
+          <div className="wheel-modal__disc wheel-modal__disc--preview">
+            <div className="wheel-modal__disc-core">
+              <span className="wheel-modal__status">Vista previa</span>
+              <strong className="wheel-modal__option is-settled">{previewWheel.title}</strong>
+              <span className="wheel-modal__amount">10 opciones</span>
+            </div>
+          </div>
+          <div className="wheel-modal__wheel-core wheel-modal__wheel-core--hidden">
+            <span className="wheel-modal__status">Vista previa</span>
+            <strong className="wheel-modal__option is-settled">{previewWheel.title}</strong>
+            <span className="wheel-modal__amount">10 opciones</span>
+          </div>
+        </div>
+        <div className="wheel-modal__content">
+          <p className="eyebrow">Preparar ruleta</p>
+          <h2>{previewWheel.title}</h2>
+          <p className="muted">Pulsa girar dentro de la modal para ejecutar la ruleta de forma visible.</p>
+          <div className="callout">
+            <strong>{wheelRequest.wheelType}</strong>
+            <br />
+            {previewWheel.playerName ? `Jugador: ${previewWheel.playerName}` : "Ruleta global"}
+          </div>
+          <div className="button-row">
+            <button className="button button-secondary" type="button" onClick={onClose}>
+              Cerrar
+            </button>
+            <button className="button button-primary" type="button" onClick={() => onSpin(wheelRequest)}>
+              Girar ruleta
+            </button>
+          </div>
+          <WheelOptionSections options={options} />
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function WinnerModal({ winner, phase, isOpen, onClose, formatMoney }) {
+  if (!winner || phase !== 6 || !isOpen) {
+    return null;
+  }
+
+  return (
+    <div className="wheel-modal-backdrop" role="dialog" aria-modal="true" aria-label="Ganador final">
+      <section className="wheel-modal panel">
+        <div className="wheel-modal__wheel-shell wheel-modal__wheel-shell--winner" aria-hidden="true">
+          <div className="wheel-modal__disc is-resolved">
+            <div className="wheel-modal__disc-core">
+              <span className="wheel-modal__status">Ganador</span>
+              <strong className="wheel-modal__option is-settled">{winner.name}</strong>
+              <span className="wheel-modal__amount">{formatMoney(winner.balance || 0)}</span>
+            </div>
+          </div>
+        </div>
+        <div className="wheel-modal__content">
+          <p className="eyebrow">Resultados finales</p>
+          <h2>Ganó {winner.name}</h2>
+          <div className="callout callout-success">
+            El equipo cerró la partida con {formatMoney(winner.balance || 0)}.
+          </div>
+          <div className="button-row">
+            <button className="button button-secondary" type="button" onClick={onClose}>
+              Cerrar
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function WheelOptionSections({ options = [] }) {
+  const grouped = groupWheelOptions(options);
+  const total = options.length || 1;
+
+  const sections = [
+    { key: "bad", title: "Opciones negativas", items: grouped.bad, className: "wheel-section--bad" },
+    { key: "good", title: "Opciones positivas", items: grouped.good, className: "wheel-section--good" },
+    { key: "neutral", title: "Opciones neutras", items: grouped.neutral, className: "wheel-section--neutral" }
+  ];
+
+  return (
+    <div className="wheel-sections">
+      {sections.map((section) => (
+        <section key={section.key} className={`wheel-section ${section.className}`}>
+          <div className="wheel-section__header">
+            <h3>{section.title}</h3>
+            <span>{Math.round((section.items.length / total) * 100)}% del 100</span>
+          </div>
+          {section.items.length ? (
+            <div className="wheel-section__list">
+              {section.items.map((option, index) => (
+                <div key={`${section.key}-${option.value}-${index}`} className="wheel-section__item">
+                  <strong>{option.label}</strong>
+                  <span>{option.amount >= 0 ? "+" : ""}{option.amount}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="empty-state">Sin opciones.</p>
+          )}
+        </section>
+      ))}
     </div>
   );
 }
@@ -1272,6 +1712,153 @@ function DecisionSection({
         ))}
       </div>
     </div>
+  );
+}
+
+function CustomDecisionForm({ disabled, balance = 0, phase, requiredPhase, currentStep = 0, requiredStep = 0, onSubmit }) {
+  const [projectName, setProjectName] = useState("");
+  const [phases, setPhases] = useState(1);
+  const [investment, setInvestment] = useState(0);
+  const [expectedReturn, setExpectedReturn] = useState(0);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  useEffect(() => {
+    setError("");
+    setSuccess("");
+  }, [projectName, phases, investment, expectedReturn]);
+
+  const isPhaseOK = phase === requiredPhase && currentStep === requiredStep;
+  const invNum = Number(investment) || 0;
+  const phNum = Number(phases) || 1;
+  const canSubmit = !disabled && isPhaseOK && projectName.trim() && invNum > 0 && invNum <= Number(balance || 0) && phNum >= 1 && phNum <= 3;
+  const maxExpectedReturn = Math.max(0, invNum * 2);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+
+    if (!isPhaseOK) {
+      setError("No se permite enviar en esta fase.");
+      return;
+    }
+
+    const name = projectName.trim();
+    if (!name) {
+      setError("El nombre del proyecto es obligatorio.");
+      return;
+    }
+
+    if (phNum < 1 || phNum > 3) {
+      setError("El número de fases debe ser entre 1 y 3.");
+      return;
+    }
+
+    if (invNum <= 0) {
+      setError("La inversión debe ser mayor a 0.");
+      return;
+    }
+
+    if (invNum > Number(balance || 0)) {
+      setError("La inversión excede el saldo disponible.");
+      return;
+    }
+
+    if (Number(expectedReturn) > maxExpectedReturn) {
+      setError("La ganancia no puede superar el doble de la inversión.");
+      return;
+    }
+
+    const decision = {
+      production: 0,
+      price: 0,
+      customProject: {
+        name,
+        phases: phNum,
+        investment: invNum,
+        expectedReturn: Number(expectedReturn) || 0
+      }
+    };
+
+    if (onSubmit) {
+      try {
+        onSubmit(decision, (ack) => {
+          if (!ack) {
+            setError("Sin respuesta del servidor.");
+            return;
+          }
+
+          if (ack.ok) {
+            setSuccess("Decisión aceptada por el servidor.");
+            setProjectName("");
+            setInvestment(0);
+            setExpectedReturn(0);
+            setPhases(1);
+          } else {
+            setError(ack.error || "Error al procesar la decisión.");
+          }
+        });
+      } catch (err) {
+        setError("Error enviando la decisión.");
+      }
+    } else {
+      setSuccess("Decisión enviada localmente.");
+      setProjectName("");
+      setInvestment(0);
+      setExpectedReturn(0);
+      setPhases(1);
+    }
+  };
+
+  return (
+    <form className="form-grid" onSubmit={handleSubmit}>
+      <label>
+        Nombre del proyecto
+        <input value={projectName} onChange={(e) => setProjectName(e.target.value)} placeholder="Mi proyecto" />
+      </label>
+      <label>
+        Número de fases (1-3)
+        <input
+          type="number"
+          min="1"
+          max="3"
+          value={phases}
+          onChange={(e) => setPhases(clampNumber(e.target.value, 1, 3))}
+        />
+      </label>
+      <label>
+        Monto a invertir (saldo disponible: {balance})
+        <input
+          type="number"
+          min="0"
+          max={balance}
+          value={investment}
+          onChange={(e) => {
+            const nextInvestment = clampNumber(e.target.value, 0, Number(balance || 0));
+            setInvestment(nextInvestment);
+            setExpectedReturn((current) => clampNumber(current, 0, nextInvestment * 2));
+          }}
+        />
+      </label>
+      <label>
+        Retorno esperado (máximo {formatMoney(maxExpectedReturn)})
+        <input
+          type="number"
+          min="0"
+          max={maxExpectedReturn}
+          value={expectedReturn}
+          onChange={(e) => setExpectedReturn(clampNumber(e.target.value, 0, maxExpectedReturn))}
+        />
+      </label>
+
+      {error ? <div className="callout callout-error">{error}</div> : null}
+      {success ? <div className="callout callout-success">{success}</div> : null}
+
+      <div className="button-row">
+        <button className="button button-primary" type="submit" disabled={!canSubmit}>
+          Enviar decisión
+        </button>
+      </div>
+    </form>
   );
 }
 

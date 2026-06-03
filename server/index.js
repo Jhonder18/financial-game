@@ -30,7 +30,7 @@ const PHASE_NAMES = {
 const PHASE_MAX_STEPS = {
   0: 0,
   1: 1,
-  2: 2,
+  2: 3,
   3: 0,
   4: 1,
   5: 1,
@@ -140,6 +140,9 @@ function createPlayer({ socketId, name, role }) {
     projectWheelResolved: false,
     projectWheelInProgress: false,
     projectWheel: null,
+    customProjects: [],
+    projectDecisionSubmitted: false,
+    currentProjectRisk: 0,
     history: {
       0: INITIAL_BALANCE,
       1: INITIAL_BALANCE,
@@ -165,13 +168,16 @@ function serializePlayer(player) {
     strategyApplied: player.strategyApplied,
     project: player.project,
     projectSelectedPhase: player.projectSelectedPhase,
-    projectReturnPhase: player.projectReturnPhase,
     projectResolved: player.projectResolved,
     projectWheelResolved: player.projectWheelResolved,
     projectWheelInProgress: player.projectWheelInProgress,
     projectWheel: player.projectWheel,
     history: { ...player.history },
-    transactions: (player.transactions || []).slice(-50)
+    transactions: (player.transactions || []).slice(-50),
+    customProjects: (player.customProjects || []).slice(-10),
+    projectDecisionSubmitted: Boolean(player.projectDecisionSubmitted),
+    projectReturnPhase: player.projectReturnPhase || null,
+    currentProjectRisk: player.currentProjectRisk || 0
   };
 }
 
@@ -244,8 +250,12 @@ function publishRoom(room, options = {}) {
         balance: player.balance,
         strategy: player.strategy,
         project: player.project,
+        projectDecisionSubmitted: player.projectDecisionSubmitted,
+        projectReturnPhase: player.projectReturnPhase,
         history: player.history,
-        transactions: player.transactions
+        transactions: player.transactions,
+        customProjects: player.customProjects || [],
+        currentProjectRisk: player.currentProjectRisk || 0
       }))
     });
   }
@@ -286,6 +296,9 @@ function resetRoomForNewGame(room) {
     player.projectWheelResolved = false;
     player.projectWheelInProgress = false;
     player.projectWheel = null;
+    player.customProjects = [];
+    player.projectDecisionSubmitted = false;
+    player.currentProjectRisk = 0;
     player.history = {
       0: INITIAL_BALANCE,
       1: INITIAL_BALANCE,
@@ -408,6 +421,210 @@ function settleProjectReturns(room, phase) {
   if (resolvedAny) {
     publishRoom(room, { balances: true, ranking: true });
   }
+}
+
+function computeRiskForProject(projectRecord) {
+  // Cálculo de riesgo basado en las reglas del usuario:
+  // - Se considera la diferencia entre retorno esperado y la inversión (profitPercent).
+  // - Según el % de margen (<=20%, 20-50%, >50%) y el tiempo (phases: 1..3) se asigna un riesgo fijo.
+  // - Si el retorno es menor que la inversión (pérdida), el riesgo es muy alto.
+  // - El valor devuelto es un % entre 0 y 100 que representa la porción "no-neutral" de la ruleta.
+  //   Del % retornado, 10% será resultado bueno y 90% resultado malo; el resto (100 - %)
+  //   será la porción neutral.
+
+  const phases = Math.max(1, Math.min(3, Number(projectRecord.phases) || 1));
+  const investment = Number(projectRecord.investment) || 0;
+  const expected = Number(projectRecord.expectedReturn) || 0;
+
+  if (investment <= 0) {
+    return 90; // inversión inválida -> riesgo muy alto
+  }
+
+  const profit = expected - investment;
+  const profitPercent = (profit / investment) * 100; // puede ser negativo
+
+  // Regla principal (mapeo explícito):
+  // profitPercent <= 20% => riesgo BAJO
+  // 20% < profitPercent <= 50% => riesgo MEDIO/ALTO dependiendo de tiempo
+  // profitPercent > 50% => riesgo ALTO/MUY ALTO
+  // profitPercent < 0 => riesgo MUY ALTO (pérdida)
+
+  let risk = 0;
+
+  if (profitPercent < 0) {
+    // Pérdida: riesgo muy alto (penaliza menos si el tiempo es más largo, pero sigue siendo alto)
+    if (phases === 1) risk = 90;
+    else if (phases === 2) risk = 85;
+    else risk = 80;
+  } else if (profitPercent <= 20) {
+    // Margen pequeño: riesgo bajo pero no nulo
+    if (phases === 1) risk = 15; // retorno en 1 fase -> bajo pero ligeramente mayor
+    else if (phases === 2) risk = 10;
+    else risk = 8; // retorno largo reduce un poco más el riesgo
+  } else if (profitPercent <= 50) {
+    // Margen medio: riesgo depende del tiempo
+    if (phases === 1) risk = 70; // corto plazo y margen medio => riesgo ALTO
+    else if (phases === 2) risk = 50; // intermedio
+    else risk = 40; // largo plazo reduce riesgo a MEDIO
+  } else {
+    // profitPercent > 50 => potencialmente atractiva pero también llamativa; tratémosla como alto riesgo
+    if (phases === 1) risk = 85; // gran ganancia en muy poco tiempo suele ser arriesgado
+    else if (phases === 2) risk = 70;
+    else risk = 60;
+  }
+
+  // Clamp final
+  if (risk < 0) risk = 0;
+  if (risk > 60) risk = 60;
+
+  return risk;
+}
+
+function allProjectDecisionsSubmitted(room) {
+  const players = room.players.filter((player) => player.role === "player");
+  return players.length > 0 && players.every((player) => player.projectDecisionSubmitted);
+}
+
+function splitBadProjectSlots(badSlots) {
+  if (badSlots <= 0) {
+    return { half: 0, third: 0, zero: 0 };
+  }
+
+  let half = Math.round(badSlots * 0.6);
+  let third = Math.round(badSlots * 0.3);
+  let zero = badSlots - half - third;
+
+  if (zero <= 0) {
+    zero = 1;
+
+    if (half >= third && half > 0) {
+      half -= 1;
+    } else if (third > 0) {
+      third -= 1;
+    }
+  }
+
+  return {
+    half,
+    third,
+    zero
+  };
+}
+
+function getCustomProjectWheelOptions(projectRecord, risk) {
+  const expectedReturn = Math.max(0, Number(projectRecord.expectedReturn) || 0);
+  const goodAmount = Math.round(expectedReturn * 1.1);
+  const neutralAmount = expectedReturn;
+  const halfAmount = Math.round(expectedReturn / 2);
+  const thirdAmount = Math.round(expectedReturn / 3);
+  const zeroAmount = 0;
+  const slots = 10;
+  const riskySlots = Math.max(0, Math.min(slots, Math.round(risk / 10)));
+  const goodCount = riskySlots > 0 ? 1 : 0;
+  const badCount = Math.max(0, riskySlots - goodCount);
+  const neutralCount = slots - riskySlots;
+  const badSplit = splitBadProjectSlots(badCount);
+
+  const options = [];
+
+  for (let index = 0; index < goodCount; index += 1) {
+    options.push({
+      label: "Retorno +10%",
+      value: "good-plus-10",
+      amount: goodAmount,
+      category: "good"
+    });
+  }
+
+  for (let index = 0; index < badSplit.half; index += 1) {
+    options.push({
+      label: "Retorno / 2",
+      value: "bad-half",
+      amount: halfAmount,
+      category: "bad"
+    });
+  }
+
+  for (let index = 0; index < badSplit.third; index += 1) {
+    options.push({
+      label: "Retorno / 3",
+      value: "bad-third",
+      amount: thirdAmount,
+      category: "bad"
+    });
+  }
+
+  for (let index = 0; index < badSplit.zero; index += 1) {
+    options.push({
+      label: "Retorno = 0",
+      value: "bad-zero",
+      amount: zeroAmount,
+      category: "bad"
+    });
+  }
+
+  for (let index = 0; index < neutralCount; index += 1) {
+    options.push({
+      label: "Retorno neutral",
+      value: "neutral",
+      amount: neutralAmount,
+      category: "neutral"
+    });
+  }
+
+  while (options.length < slots) {
+    options.push({ label: "Retorno neutral", value: "neutral", amount: neutralAmount, category: "neutral" });
+  }
+
+  return options.slice(0, slots);
+}
+
+function applyCustomProjectWheelResult(room, player, selectedOption) {
+  const projectRecord = (player.customProjects || []).slice(-1)[0] || null;
+
+  if (!projectRecord) {
+    return null;
+  }
+
+  const reward = Number(selectedOption?.amount) || 0;
+  const wheelResult = {
+    type: "customProject",
+    scope: "individual",
+    status: "resolved",
+    title: `Retorno de ${projectRecord.name}`,
+    audience: player.name,
+    playerId: player.id,
+    playerName: player.name,
+    projectName: projectRecord.name,
+    risk: player.currentProjectRisk || computeRiskForProject(projectRecord),
+    returnPhase: projectRecord.returnPhase || projectRecord.phases,
+    options: getCustomProjectWheelOptions(projectRecord, player.currentProjectRisk || computeRiskForProject(projectRecord)),
+    selectedOption: selectedOption?.value || "neutral",
+    label: selectedOption?.label || "Retorno neutral",
+    amount: reward,
+    outcome: selectedOption?.label || "Retorno neutral"
+  };
+
+  player.balance += reward;
+  player.projectWheelResolved = true;
+  player.projectResolved = true;
+  player.projectWheelInProgress = false;
+  player.projectWheel = wheelResult;
+  player.history[room.phase] = player.balance;
+  player.transactions = player.transactions || [];
+  player.transactions.push({
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    time: timestamp(),
+    phase: room.phase,
+    type: "project-wheel-custom",
+    amount: reward,
+    description: `Ruleta proyecto personalizado: ${selectedOption?.label || "Retorno neutral"}`
+  });
+
+  pushLog(room, `${player.name} resolvió su proyecto '${projectRecord.name}' con ${selectedOption?.label || "Retorno neutral"}.`);
+  finalizeProjectWheel(room, player, wheelResult);
+
+  return wheelResult;
 }
 
 function finalizeGlobalWheel(room, wheelType, resolvedWheel) {
@@ -638,6 +855,103 @@ io.on("connection", (socket) => {
     publishRoom(room, { balances: true, ranking: true });
   });
 
+  // Soporte para decisiones que incluyen proyectos personalizados con ack callback
+  socket.on("submit-decision", (payload = {}, callback) => {
+    const { roomCode, playerId, decision } = payload || {};
+    const room = getRoom(roomCode);
+    const player = getPlayerById(room, playerId) || getPlayer(room, socket.id);
+
+    if (!room.started || room.phase !== 2 || !player) {
+      if (typeof callback === "function") callback({ ok: false, error: "Juego no iniciado o jugador inválido." });
+      return;
+    }
+
+    if ((room.phaseStep || 0) < 2) {
+      if (typeof callback === "function") callback({ ok: false, error: "Fase de proyectos no habilitada." });
+      return;
+    }
+
+    if (decision && typeof decision === "object") {
+      const prod = Number(decision.production) || 0;
+      const price = Number(decision.price) || 0;
+      player.pendingDecision = { production: prod, price };
+    }
+
+    const cp = decision && decision.customProject;
+
+    if (cp && typeof cp === "object") {
+      const name = String(cp.name || "").trim();
+      const investment = Number(cp.investment) || 0;
+      const phases = Number(cp.phases) || 1;
+      const expectedReturn = Number(cp.expectedReturn) || 0;
+
+      if (!name || investment <= 0) {
+        if (typeof callback === "function") callback({ ok: false, error: "Nombre o inversión inválida." });
+        return;
+      }
+
+      if (investment > player.balance) {
+        if (typeof callback === "function") callback({ ok: false, error: "Saldo insuficiente." });
+        return;
+      }
+
+      player.balance -= investment;
+      player.history[room.phase] = player.balance;
+      player.transactions = player.transactions || [];
+      player.transactions.push({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        time: timestamp(),
+        phase: room.phase,
+        type: "project-invest-custom",
+        amount: -investment,
+        description: `Inversión en proyecto personalizado: ${name}`
+      });
+
+      player.customProjects = player.customProjects || [];
+      const projectRecord = {
+        name,
+        investment,
+        phases,
+        expectedReturn,
+        returnPhase: room.phase + phases,
+        phase: room.phase,
+        time: timestamp()
+      };
+      player.customProjects.push(projectRecord);
+
+      player.project = name;
+      player.projectSelectedPhase = room.phase;
+      player.projectReturnPhase = projectRecord.returnPhase;
+      player.projectDecisionSubmitted = true;
+
+      pushLog(room, `${player.name} invirtió ${investment} en proyecto personalizado '${name}'.`);
+
+      publishRoom(room, { balances: true, ranking: true });
+
+      // Si todos los jugadores han enviado su decisión de proyecto, calcular riesgos y emitirlos
+      const playersNeeding = room.players.filter((p) => p.role === "player");
+      const allSubmitted = allProjectDecisionsSubmitted(room);
+
+      if (allSubmitted) {
+        const risks = playersNeeding.map((p) => {
+          const lastProject = (p.customProjects || []).slice(-1)[0] || null;
+          const risk = lastProject ? computeRiskForProject(lastProject) : 0;
+          p.currentProjectRisk = risk;
+          return { playerId: p.id, name: p.name, risk, returnPhase: p.projectReturnPhase || null };
+        });
+
+        // Publicar riesgos a la sala
+        publishRoom(room, { balances: true, ranking: true });
+        io.to(room.roomCode).emit("risk-updated", { risks });
+      }
+
+      if (typeof callback === "function") callback({ ok: true, balance: player.balance, customProject: projectRecord });
+      return;
+    }
+
+    if (typeof callback === "function") callback({ ok: true });
+  });
+
   socket.on("submit-month-values", ({ roomCode, income = 0, expenses = 0, specialEventActive = false } = {}) => {
     const room = getRoom(roomCode);
 
@@ -857,6 +1171,52 @@ io.on("connection", (socket) => {
       return;
     }
 
+    if (wheelType === "projectReturn") {
+      const projectRecord = (player.customProjects || []).slice(-1)[0] || null;
+
+      if (!projectRecord || player.projectWheelResolved || room.phase !== projectRecord.returnPhase) {
+        return;
+      }
+
+      const risk = player.currentProjectRisk || computeRiskForProject(projectRecord);
+      const options = getCustomProjectWheelOptions(projectRecord, risk);
+      const selected = options[Math.floor(Math.random() * options.length)];
+
+      player.projectWheel = {
+        type: "projectReturn",
+        scope: "individual",
+        status: "spinning",
+        option: selected.value,
+        amount: selected.amount,
+        label: selected.label,
+        outcome: selected.label,
+        title: `Retorno de ${projectRecord.name}`,
+        audience: player.name,
+        options,
+        selectedOption: selected.value,
+        playerId: player.id,
+        playerName: player.name,
+        projectName: projectRecord.name,
+        projectRisk: risk,
+        returnPhase: projectRecord.returnPhase
+      };
+
+      player.projectWheelInProgress = true;
+      emitWheelEvent([room.adminSocketId, player.socketId], "wheel-start", player.projectWheel);
+
+      setTimeout(() => {
+        const currentWheel = player.projectWheel;
+
+        if (!currentWheel || currentWheel.status !== "spinning") {
+          return;
+        }
+
+        applyCustomProjectWheelResult(room, player, selected);
+      }, 1800);
+
+      return;
+    }
+
     if (wheelType === "projectX" && player.project === "X" && !player.projectWheelResolved && room.phase === 4) {
       const options = [
         { label: "Retorno reducido a la mitad", value: "half" },
@@ -1061,6 +1421,10 @@ io.on("connection", (socket) => {
     }
 
     if (room.phase === 2 && hasPendingStrategyWheels(room)) {
+      return;
+    }
+
+    if (room.phase === 2 && (room.phaseStep || 0) === 2 && !allProjectDecisionsSubmitted(room)) {
       return;
     }
 
