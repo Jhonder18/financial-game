@@ -787,11 +787,7 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
   const currentPhase = snapshot?.phase ?? 0;
   const currentStep = snapshot?.phaseStep ?? 0;
   const hasMonthlyApplied = snapshot?.monthlyInputs?.[currentPhase] !== undefined;
-  const isStrategyWheelBusy = snapshot?.wheels?.strategyA?.status === "spinning" || snapshot?.wheels?.strategyC?.status === "spinning";
   const allProjectSubmitted = allProjectDecisionsSubmitted(snapshot);
-  const hasPendingProjectWheel =
-    (currentPhase === 4 && (snapshot?.players || []).some((player) => player.project === "X" && !player.projectWheelResolved)) ||
-    (currentPhase === 5 && (snapshot?.players || []).some((player) => player.project === "Y" && !player.projectWheelResolved));
   const showPhase2MonthlyControl = currentPhase === 2 && currentStep >= 1;
   const showPhase45MonthlyControl = (currentPhase === 4 || currentPhase === 5) && currentStep === 0;
   const pendingProjectReturns = (snapshot?.players || []).filter(
@@ -809,10 +805,8 @@ function HostPage({ snapshot, lastWheel, emitJoin, emitStart, emitNext, emitNext
     isStarted &&
     currentPhase > 0 &&
     currentPhase < 6 &&
-    currentStep < maxStepForPhase &&
-    !isStrategyWheelBusy &&
-    !(currentPhase === 2 && currentStep === 2 && !allProjectSubmitted);
-  const canGoNextPhase = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep >= maxStepForPhase && !hasPendingProjectWheel && !pendingProjectReturns.length;
+    currentStep < maxStepForPhase;
+  const canGoNextPhase = isStarted && currentPhase > 0 && currentPhase < 6 && currentStep >= maxStepForPhase;
   const monthlyForCurrentPhase = snapshot?.monthlyInputs?.[currentPhase] || null;
 
   const openWheelPreview = (payload) => {

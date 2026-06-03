@@ -1374,18 +1374,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    if (room.phase === 2 && hasPendingStrategyWheels(room)) {
-      return;
-    }
-
-    if (room.phase === 4 && hasPendingProjectWheels(room, "X")) {
-      return;
-    }
-
-    if (room.phase === 5 && hasPendingProjectWheels(room, "Y")) {
-      return;
-    }
-
     setPhaseSnapshot(room, room.phase);
 
     if (room.phase === 2) {
@@ -1417,14 +1405,6 @@ io.on("connection", (socket) => {
     const requiredSteps = PHASE_MAX_STEPS[room.phase] || 0;
 
     if (requiredSteps === 0 || (room.phaseStep || 0) >= requiredSteps) {
-      return;
-    }
-
-    if (room.phase === 2 && hasPendingStrategyWheels(room)) {
-      return;
-    }
-
-    if (room.phase === 2 && (room.phaseStep || 0) === 2 && !allProjectDecisionsSubmitted(room)) {
       return;
     }
 
